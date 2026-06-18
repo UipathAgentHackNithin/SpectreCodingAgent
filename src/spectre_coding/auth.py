@@ -39,10 +39,12 @@ def get_llm_token() -> tuple[str, str]:
     if _llm_token_cache.get("access_token") and time.time() < _llm_token_cache.get("expires_at", 0):
         return _llm_token_cache["access_token"], base_url
 
+    # On robot or locally with env var — use it directly (same pattern as InvestigationAgent)
+    env_token = _get_robot_token()
+    if env_token:
+        return env_token, base_url
+
     if os.path.exists(_AUTH_PATH):
-        env_token = _get_robot_token()
-        if env_token:
-            return env_token, base_url
         with open(_AUTH_PATH) as f:
             data = json.load(f)
         issued_at = data.get("issued_at", time.time())
