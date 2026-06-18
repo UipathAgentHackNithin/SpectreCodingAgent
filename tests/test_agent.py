@@ -14,23 +14,18 @@ FIX_IN = FixIn(
 
 _P_FIND = "spectre_coding.agent.find_repo_by_process"
 _P_DUP = "spectre_coding.agent.check_duplicate"
-_P_CLONE = "spectre_coding.agent.clone_repo"
-_P_SCAN = "spectre_coding.agent.scan_repo_xamls"
+_P_ENSURE_BRANCH = "spectre_coding.agent.ensure_branch"
+_P_FETCH = "spectre_coding.agent.fetch_xaml_listing"
+_P_FETCH_CONTENTS = "spectre_coding.agent.fetch_xaml_contents"
 _P_SUMMARY = "spectre_coding.agent.build_repo_summary"
 _P_SELECT = "spectre_coding.agent.select_target_files"
 _P_ANALYSE = "spectre_coding.agent.analyse_and_fix"
-_P_PUSH = "spectre_coding.agent.push_branch"
+_P_COMMIT = "spectre_coding.agent.commit_file_to_branch"
+_P_COMMIT_REPORT = "spectre_coding.agent.commit_file_to_branch"
+_P_REPORT = "spectre_coding.agent._commit_report"
 _P_PR = "spectre_coding.agent.create_draft_pr"
 _P_OWNER = "spectre_coding.agent.get_codeowner"
 _P_AUTH = "spectre_coding.agent.get_llm_token"
-_P_TMPDIR = "tempfile.TemporaryDirectory"
-
-
-def _tmpdir_mock(path="/tmp/fake"):
-    m = MagicMock()
-    m.__enter__ = MagicMock(return_value=path)
-    m.__exit__ = MagicMock(return_value=False)
-    return m
 
 
 def _selection(candidates, confidence="High"):
@@ -80,17 +75,13 @@ class TestAgentFlow:
             patch(_P_FIND, return_value="Org/Bot"),
             patch(_P_DUP, return_value=None),
             patch(_P_AUTH, return_value=("tok", "http://x")),
-            patch(_P_TMPDIR, return_value=_tmpdir_mock()),
-            patch(_P_CLONE),
-            patch(_P_SCAN, return_value=[{"path": "Framework/Process.xaml"}]),
+            patch(_P_ENSURE_BRANCH),
+            patch(_P_FETCH, return_value=[{"path": "Framework/Process.xaml", "size": 100}]),
             patch(_P_SUMMARY, return_value="summary"),
             patch(_P_SELECT, AsyncMock(return_value=_selection(["Framework/Process.xaml"]))),
-            patch("builtins.open", MagicMock(return_value=MagicMock(
-                __enter__=MagicMock(return_value=MagicMock(read=MagicMock(return_value="<old/>"))),
-                __exit__=MagicMock(return_value=False),
-            ))),
+            patch(_P_FETCH_CONTENTS, return_value={"Framework/Process.xaml": "<old/>"}),
             patch(_P_ANALYSE, AsyncMock(return_value=_fix_result())),
-            patch(_P_PUSH),
+            patch(_P_COMMIT),
             patch(_P_OWNER, return_value="nithin-br"),
             patch(_P_PR, return_value="https://github.com/Org/Bot/pull/1"),
         ):
@@ -111,18 +102,16 @@ class TestAgentFlow:
             patch(_P_FIND, return_value="Org/Bot"),
             patch(_P_DUP, return_value=None),
             patch(_P_AUTH, return_value=("tok", "http://x")),
-            patch(_P_TMPDIR, return_value=_tmpdir_mock()),
-            patch(_P_CLONE),
-            patch(_P_SCAN, return_value=[]),
+            patch(_P_ENSURE_BRANCH),
+            patch(_P_FETCH, return_value=[]),
             patch(_P_SUMMARY, return_value=""),
             patch(_P_SELECT, AsyncMock(return_value=_selection([]))),
-            patch(_P_PUSH),
+            patch(_P_REPORT),
             patch(_P_OWNER, return_value=None),
             patch(_P_PR, side_effect=capture_pr),
         ):
             from spectre_coding.agent import fix
             await fix(FIX_IN)
-        # create_draft_pr was called — draft is enforced inside that function
         assert pr_kwargs["repo"] == "Org/Bot"
 
     @pytest.mark.asyncio
@@ -137,17 +126,13 @@ class TestAgentFlow:
             patch(_P_FIND, return_value="Org/Bot"),
             patch(_P_DUP, return_value=None),
             patch(_P_AUTH, return_value=("tok", "http://x")),
-            patch(_P_TMPDIR, return_value=_tmpdir_mock()),
-            patch(_P_CLONE),
-            patch(_P_SCAN, return_value=[{"path": "Process.xaml"}]),
+            patch(_P_ENSURE_BRANCH),
+            patch(_P_FETCH, return_value=[{"path": "Process.xaml", "size": 100}]),
             patch(_P_SUMMARY, return_value="summary"),
             patch(_P_SELECT, AsyncMock(return_value=_selection(["Process.xaml"], confidence="Low"))),
-            patch("builtins.open", MagicMock(return_value=MagicMock(
-                __enter__=MagicMock(return_value=MagicMock(read=MagicMock(return_value="<xml/>"))),
-                __exit__=MagicMock(return_value=False),
-            ))),
+            patch(_P_FETCH_CONTENTS, return_value={"Process.xaml": "<xml/>"}),
             patch(_P_ANALYSE, AsyncMock(return_value=_fix_result(can_fix=False, confidence="Low"))),
-            patch(_P_PUSH),
+            patch(_P_REPORT),
             patch(_P_OWNER, return_value=None),
             patch(_P_PR, side_effect=capture_pr),
         ):
@@ -157,30 +142,131 @@ class TestAgentFlow:
 
     @pytest.mark.asyncio
     async def test_target_activity_propagated_to_fixout(self):
-        file_handle = MagicMock()
-        file_handle.read.return_value = "content"
-        ctx = MagicMock()
-        ctx.__enter__ = MagicMock(return_value=file_handle)
-        ctx.__exit__ = MagicMock(return_value=False)
         with (
             patch(_P_FIND, return_value="Org/Bot"),
             patch(_P_DUP, return_value=None),
             patch(_P_AUTH, return_value=("tok", "http://x")),
-            patch(_P_TMPDIR, return_value=_tmpdir_mock()),
-            patch(_P_CLONE),
-            patch(_P_SCAN, return_value=[{"path": "Framework/Process.xaml"}]),
+            patch(_P_ENSURE_BRANCH),
+            patch(_P_FETCH, return_value=[{"path": "Framework/Process.xaml", "size": 100}]),
             patch(_P_SUMMARY, return_value="summary"),
             patch(_P_SELECT, AsyncMock(return_value=_selection(["Framework/Process.xaml"]))),
-            patch("os.path.exists", return_value=True),
-            patch("builtins.open", return_value=ctx),
+            patch(_P_FETCH_CONTENTS, return_value={"Framework/Process.xaml": "<old/>"}),
             patch(_P_ANALYSE, AsyncMock(return_value=_fix_result(can_fix=True))),
-            patch(_P_PUSH),
+            patch(_P_COMMIT),
             patch(_P_OWNER, return_value=None),
             patch(_P_PR, return_value="https://github.com/Org/Bot/pull/4"),
         ):
             from spectre_coding.agent import fix
             result = await fix(FIX_IN)
         assert result.target_activity == "Click Login Button"
+
+
+class TestPatchApply:
+    @pytest.mark.asyncio
+    async def test_patch_applied_when_snippet_found_verbatim(self):
+        committed = {}
+
+        def capture_commit(repo, branch, path, content, msg):
+            committed["content"] = content
+
+        with (
+            patch(_P_FIND, return_value="Org/Bot"),
+            patch(_P_DUP, return_value=None),
+            patch(_P_AUTH, return_value=("tok", "http://x")),
+            patch(_P_ENSURE_BRANCH),
+            patch(_P_FETCH, return_value=[{"path": "Framework/Process.xaml", "size": 100}]),
+            patch(_P_SUMMARY, return_value="summary"),
+            patch(_P_SELECT, AsyncMock(return_value=_selection(["Framework/Process.xaml"]))),
+            patch(_P_FETCH_CONTENTS, return_value={"Framework/Process.xaml": "<old/>"}),
+            patch(_P_ANALYSE, AsyncMock(return_value=_fix_result())),
+            patch(_P_COMMIT, side_effect=capture_commit),
+            patch(_P_OWNER, return_value=None),
+            patch(_P_PR, return_value="https://github.com/Org/Bot/pull/1"),
+        ):
+            from spectre_coding.agent import fix
+            result = await fix(FIX_IN)
+
+        assert result.fixed is True
+        assert "<new/>" in committed["content"]
+        assert "<old/>" not in committed["content"]
+
+    @pytest.mark.asyncio
+    async def test_patch_skipped_when_replacement_is_invalid_xml(self):
+        bad_fix = _fix_result()
+        bad_fix["replacement_snippet"] = "<unclosed"
+
+        committed = []
+        reported = []
+
+        with (
+            patch(_P_FIND, return_value="Org/Bot"),
+            patch(_P_DUP, return_value=None),
+            patch(_P_AUTH, return_value=("tok", "http://x")),
+            patch(_P_ENSURE_BRANCH),
+            patch(_P_FETCH, return_value=[{"path": "Framework/Process.xaml", "size": 100}]),
+            patch(_P_SUMMARY, return_value="summary"),
+            patch(_P_SELECT, AsyncMock(return_value=_selection(["Framework/Process.xaml"]))),
+            patch(_P_FETCH_CONTENTS, return_value={"Framework/Process.xaml": "<old/>"}),
+            patch(_P_ANALYSE, AsyncMock(return_value=bad_fix)),
+            patch(_P_COMMIT, side_effect=lambda *a, **k: committed.append(a)),
+            patch(_P_REPORT, side_effect=lambda *a, **k: reported.append(a)),
+            patch(_P_OWNER, return_value=None),
+            patch(_P_PR, return_value="https://github.com/Org/Bot/pull/1"),
+        ):
+            from spectre_coding.agent import fix
+            result = await fix(FIX_IN)
+
+        assert result.fixed is False
+        assert len(committed) == 0
+
+    @pytest.mark.asyncio
+    async def test_patch_skipped_when_snippet_not_in_file(self):
+        no_match_fix = _fix_result()
+        no_match_fix["original_snippet"] = "<does_not_exist/>"
+
+        committed = []
+        reported = []
+
+        with (
+            patch(_P_FIND, return_value="Org/Bot"),
+            patch(_P_DUP, return_value=None),
+            patch(_P_AUTH, return_value=("tok", "http://x")),
+            patch(_P_ENSURE_BRANCH),
+            patch(_P_FETCH, return_value=[{"path": "Framework/Process.xaml", "size": 100}]),
+            patch(_P_SUMMARY, return_value="summary"),
+            patch(_P_SELECT, AsyncMock(return_value=_selection(["Framework/Process.xaml"]))),
+            patch(_P_FETCH_CONTENTS, return_value={"Framework/Process.xaml": "<old/>"}),
+            patch(_P_ANALYSE, AsyncMock(return_value=no_match_fix)),
+            patch(_P_COMMIT, side_effect=lambda *a, **k: committed.append(a)),
+            patch(_P_REPORT, side_effect=lambda *a, **k: reported.append(a)),
+            patch(_P_OWNER, return_value=None),
+            patch(_P_PR, return_value="https://github.com/Org/Bot/pull/1"),
+        ):
+            from spectre_coding.agent import fix
+            result = await fix(FIX_IN)
+
+        assert result.fixed is False
+        assert len(committed) == 0
+
+    def test_pr_body_includes_skip_reason_when_xml_invalid(self):
+        from spectre_coding.agent import _build_pr_body
+        fr = _fix_result(can_fix=True)
+        fr["_actually_patched"] = False
+        body = _build_pr_body(
+            FIX_IN, fr, patched=False,
+            patch_skip_reason="LLM-generated replacement_snippet is not valid XML: unclosed token",
+        )
+        assert "not valid XML" in body
+
+    def test_pr_body_includes_skip_reason_when_snippet_not_found(self):
+        from spectre_coding.agent import _build_pr_body
+        fr = _fix_result(can_fix=True)
+        fr["_actually_patched"] = False
+        body = _build_pr_body(
+            FIX_IN, fr, patched=False,
+            patch_skip_reason="original_snippet not found verbatim in `Framework/Process.xaml`",
+        )
+        assert "not found verbatim" in body
 
 
 class TestPrBodyBuilders:
@@ -220,3 +306,10 @@ class TestPrBodyBuilders:
         from spectre_coding.agent import _build_pr_title
         title = _build_pr_title(FIX_IN, _fix_result(can_fix=False), patched=False)
         assert "Report" in title
+
+    def test_body_shows_patch_skip_reason_when_provided(self):
+        from spectre_coding.agent import _build_pr_body
+        fr = _fix_result(can_fix=True)
+        fr["_actually_patched"] = False
+        body = _build_pr_body(FIX_IN, fr, patched=False, patch_skip_reason="some reason here")
+        assert "some reason here" in body

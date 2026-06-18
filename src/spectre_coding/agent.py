@@ -3,34 +3,39 @@ SpectreCodingAgent — orchestrates the full fix flow.
 
 1. Find GitHub repo by process number topic
 2. Check for duplicate PRs/issues
-3. Clone repo, scan all XAML files
+3. Fetch all XAML files via GitHub API (no clone)
 4. LLM call 1: select candidate files from repo summary
 5. LLM call 2: analyse candidates and produce surgical fix
-6. Apply patch if possible
-7. Push branch, open DRAFT PR with labels + assignee
+6. Apply patch if possible, commit via API
+7. Open DRAFT PR with labels + assignee
 """
 import asyncio
 import os
-import tempfile
+import time
+import xml.etree.ElementTree as ET
 from pydantic import BaseModel
 
 try:
     from .logger import get_logger
     from .auth import get_llm_token
     from .github_client import (
-        find_repo_by_process, check_duplicate, clone_repo,
-        push_branch, create_draft_pr, get_codeowner,
+        find_repo_by_process, check_duplicate,
+        fetch_xaml_listing, fetch_xaml_contents,
+        commit_file_to_branch, ensure_branch,
+        create_draft_pr, get_codeowner, _commit_report,
     )
-    from .xaml_scanner import scan_repo_xamls, build_repo_summary
+    from .xaml_scanner import build_repo_summary
     from .llm import select_target_files, analyse_and_fix
 except ImportError:
     from logger import get_logger
     from auth import get_llm_token
     from github_client import (
-        find_repo_by_process, check_duplicate, clone_repo,
-        push_branch, create_draft_pr, get_codeowner,
+        find_repo_by_process, check_duplicate,
+        fetch_xaml_listing, fetch_xaml_contents,
+        commit_file_to_branch, ensure_branch,
+        create_draft_pr, get_codeowner, _commit_report,
     )
-    from xaml_scanner import scan_repo_xamls, build_repo_summary
+    from xaml_scanner import build_repo_summary
     from llm import select_target_files, analyse_and_fix
 
 log = get_logger("spectre.coding_agent")
@@ -81,72 +86,73 @@ async def fix(input: FixIn) -> FixOut:
 
     llm_token, base_url = get_llm_token()
 
-    with tempfile.TemporaryDirectory() as tmp_dir:
-        # ── 3. Clone + scan ───────────────────────────────────────────────────
-        clone_repo(repo_full_name, tmp_dir)
-        scan_results = scan_repo_xamls(tmp_dir)
-        repo_summary = build_repo_summary(scan_results)
-        log.info(f"Scanned {len(scan_results)} XAML files")
+    # ── 3. Fetch XAML listing ─────────────────────────────────────────────────
+    branch_name = f"spectre-fix/{input.transaction_id.lower()}"
+    ensure_branch(repo_full_name, branch_name)
 
-        # ── 4. LLM call 1: file selection ─────────────────────────────────────
-        selection = await select_target_files(llm_token, base_url, input.diagnosis, repo_summary)
-        candidates = selection.get("candidates", [])[:3]
-        selection_confidence = selection.get("confidence", "Low")
-        log.info(f"File selection: candidates={candidates} confidence={selection_confidence}")
+    scan_results = fetch_xaml_listing(repo_full_name)
+    repo_summary = build_repo_summary(scan_results)
+    log.info(f"Fetched listing of {len(scan_results)} XAML files")
 
-        if not candidates:
-            log.warning("LLM could not identify candidate files — opening report-only PR")
-            fix_result = _no_fix_result("LLM could not identify the relevant XAML file from repo structure", "Low")
+    # ── 4. LLM call 1: file selection ─────────────────────────────────────────
+    selection = await select_target_files(llm_token, base_url, input.diagnosis, repo_summary)
+    candidates = selection.get("candidates", [])[:3]
+    selection_confidence = selection.get("confidence", "Low")
+    log.info(f"File selection: candidates={candidates} confidence={selection_confidence}")
+
+    patch_skip_reason = ""
+
+    if not candidates:
+        log.warning("LLM could not identify candidate files — opening report-only PR")
+        fix_result = _no_fix_result("LLM could not identify the relevant XAML file from repo structure", "Low")
+    else:
+        # ── 5. Fetch candidate file contents ──────────────────────────────────
+        candidate_files = fetch_xaml_contents(repo_full_name, candidates)
+
+        if not candidate_files:
+            fix_result = _no_fix_result("Candidate files identified but could not be read", "Low")
         else:
-            # ── 5. Read candidate file contents ───────────────────────────────
-            candidate_files = {}
-            path_map = {r["path"]: r for r in scan_results}
-            for c in candidates:
-                # normalise path separators
-                norm = c.replace("/", os.sep).replace("\\", os.sep)
-                full = os.path.join(tmp_dir, norm)
-                if os.path.exists(full):
-                    with open(full, "r", encoding="utf-8") as fh:
-                        candidate_files[c] = fh.read()
-                else:
-                    log.warning(f"Candidate file not found on disk: {c}")
+            # ── 6. LLM call 2: analyse and fix ────────────────────────────────
+            fix_result = await analyse_and_fix(
+                llm_token, base_url,
+                input.diagnosis, input.recommended_action,
+                candidate_files,
+            )
+            log.info(f"Fix analysis: can_fix={fix_result.get('can_fix')} confidence={fix_result.get('confidence')}")
 
-            if not candidate_files:
-                fix_result = _no_fix_result("Candidate files identified but could not be read", "Low")
-            else:
-                # ── 6. LLM call 2: analyse and fix ────────────────────────────
-                fix_result = await analyse_and_fix(
-                    llm_token, base_url,
-                    input.diagnosis, input.recommended_action,
-                    candidate_files,
-                )
-                log.info(f"Fix analysis: can_fix={fix_result.get('can_fix')} confidence={fix_result.get('confidence')}")
+            # Apply patch if possible
+            if fix_result.get("can_fix") and fix_result.get("original_snippet"):
+                target_file = fix_result.get("target_file", "")
+                original = fix_result["original_snippet"]
+                replacement = fix_result.get("replacement_snippet", "")
+                original_content = candidate_files.get(target_file)
 
-                # Apply patch if possible
-                if fix_result.get("can_fix") and fix_result.get("original_snippet"):
-                    target_file = fix_result.get("target_file", "")
-                    norm = target_file.replace("/", os.sep).replace("\\", os.sep)
-                    full_target = os.path.join(tmp_dir, norm)
-                    if os.path.exists(full_target):
-                        with open(full_target, "r", encoding="utf-8") as fh:
-                            content = fh.read()
-                        original = fix_result["original_snippet"]
-                        if original in content:
-                            patched = content.replace(original, fix_result["replacement_snippet"], 1)
-                            with open(full_target, "w", encoding="utf-8") as fh:
-                                fh.write(patched)
-                            fix_result["_actually_patched"] = True
-                            log.info(f"Patch applied to {target_file}")
-                        else:
-                            fix_result["_actually_patched"] = False
-                            log.warning("original_snippet not found verbatim — patch skipped")
+                replacement_valid = True
+                try:
+                    ET.fromstring(replacement)
+                except ET.ParseError as xml_err:
+                    replacement_valid = False
+                    patch_skip_reason = f"LLM-generated replacement_snippet is not valid XML: {xml_err}"
+                    log.warning(f"replacement_snippet is not valid XML — patch skipped: {xml_err}")
+                    fix_result["_actually_patched"] = False
+                    fix_result["target_file"] = ""
+                    _commit_report(repo_full_name, branch_name, input, fix_result)
+
+                if replacement_valid:
+                    if original_content and original in original_content:
+                        patched = original_content.replace(original, replacement, 1)
+                        commit_msg = fix_result.get("commit_message") or f"[SpectreAI] Fix for {input.transaction_id}"
+                        commit_file_to_branch(repo_full_name, branch_name, target_file, patched, commit_msg)
+                        fix_result["_actually_patched"] = True
+                        log.info(f"Patch committed to {target_file} on {branch_name}")
                     else:
+                        patch_skip_reason = f"original_snippet not found verbatim in `{target_file}` — possible whitespace drift or truncation"
                         fix_result["_actually_patched"] = False
-
-        # ── 7. Push branch ────────────────────────────────────────────────────
-        branch_name = f"spectre-fix/{input.transaction_id.lower()}"
-        commit_msg = fix_result.get("commit_message") or f"[SpectreAI] Diagnosis report for {input.transaction_id}"
-        push_branch(tmp_dir, branch_name, commit_msg)
+                        fix_result["target_file"] = ""
+                        log.warning("original_snippet not found verbatim — patch skipped")
+                        _commit_report(repo_full_name, branch_name, input, fix_result)
+            else:
+                _commit_report(repo_full_name, branch_name, input, fix_result)
 
     # ── Build labels ──────────────────────────────────────────────────────────
     llm_confidence = fix_result.get("confidence", "Low")
@@ -161,7 +167,7 @@ async def fix(input: FixIn) -> FixOut:
     # ── Open draft PR ─────────────────────────────────────────────────────────
     actually_patched = fix_result.get("_actually_patched", False)
     pr_title = _build_pr_title(input, fix_result, actually_patched)
-    pr_body = _build_pr_body(input, fix_result, actually_patched)
+    pr_body = _build_pr_body(input, fix_result, actually_patched, selection_confidence, branch_name, patch_skip_reason)
     pr_url = create_draft_pr(repo_full_name, branch_name, pr_title, pr_body, labels, assignee)
 
     log.info(f"Draft PR opened: {pr_url}")
@@ -207,7 +213,14 @@ def _build_pr_title(input: FixIn, fix_result: dict, patched: bool) -> str:
     return f"[SpectreAI {tag}] {input.process_name} — {input.transaction_id}"
 
 
-def _build_pr_body(input: FixIn, fix_result: dict, patched: bool) -> str:
+def _build_pr_body(
+    input: FixIn,
+    fix_result: dict,
+    patched: bool,
+    selection_confidence: str = "Low",
+    branch_name: str = "",
+    patch_skip_reason: str = "",
+) -> str:
     status = "Code change applied" if patched else "Report only — manual fix required"
     diff_section = ""
 
@@ -220,9 +233,11 @@ def _build_pr_body(input: FixIn, fix_result: dict, patched: bool) -> str:
             f"**After:**\n```xml\n{fix_result['replacement_snippet']}\n```\n"
         )
     elif not patched and fix_result.get("original_snippet"):
+        skip_note = f"\n> **Patch not applied:** {patch_skip_reason}\n" if patch_skip_reason else ""
         diff_section = (
             f"\n### Proposed Change (apply manually)\n"
-            f"**File:** `{fix_result['target_file']}`  \n"
+            f"{skip_note}"
+            f"**File:** `{fix_result.get('target_file') or 'see diagnosis'}`  \n"
             f"**Activity:** `{fix_result.get('target_activity', 'unknown')}`\n\n"
             f"**Replace:**\n```xml\n{fix_result['original_snippet']}\n```\n\n"
             f"**With:**\n```xml\n{fix_result['replacement_snippet']}\n```\n"

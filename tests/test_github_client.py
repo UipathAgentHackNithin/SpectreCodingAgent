@@ -4,10 +4,11 @@ from unittest.mock import MagicMock, patch, call
 from github import GithubException
 
 
-def _make_repo(full_name, topics):
+def _make_repo(full_name, topics=None):
     repo = MagicMock()
     repo.full_name = full_name
-    repo.get_topics.return_value = topics
+    if topics is not None:
+        repo.get_topics.return_value = topics
     return repo
 
 
@@ -29,18 +30,17 @@ def _make_issue(title, url):
 
 class TestFindRepoByProcess:
     @patch("spectre_coding.github_client.Github")
-    def test_finds_repo_by_process_number_topic(self, MockGithub):
-        org = MagicMock()
-        org.get_repos.return_value = [_make_repo("Org/InvoiceBot", ["3201-invoice-processing"])]
-        MockGithub.return_value.get_organization.return_value = org
+    def test_finds_repo_via_search_api(self, MockGithub):
+        repo = _make_repo("Org/InvoiceBot")
+        MockGithub.return_value.search_repositories.return_value = [repo]
         from spectre_coding.github_client import find_repo_by_process
         assert find_repo_by_process("3201 Invoice Processing") == "Org/InvoiceBot"
+        query = MockGithub.return_value.search_repositories.call_args[0][0]
+        assert "topic:3201" in query
 
     @patch("spectre_coding.github_client.Github")
-    def test_returns_none_when_no_matching_topic(self, MockGithub):
-        org = MagicMock()
-        org.get_repos.return_value = [_make_repo("Org/Other", ["9999-other"])]
-        MockGithub.return_value.get_organization.return_value = org
+    def test_returns_none_when_search_empty(self, MockGithub):
+        MockGithub.return_value.search_repositories.return_value = []
         from spectre_coding.github_client import find_repo_by_process
         assert find_repo_by_process("3201 Invoice Processing") is None
 
@@ -138,7 +138,7 @@ class TestCreateDraftPr:
         pr = MagicMock()
         pr.html_url = "https://github.com/Org/Repo/pull/11"
         repo = MagicMock()
-        repo.get_labels.return_value = []  # no existing labels
+        repo.get_labels.return_value = []
         repo.create_pull.return_value = pr
         MockGithub.return_value.get_repo.return_value = repo
 
@@ -179,3 +179,21 @@ class TestCreateDraftPr:
         from spectre_coding.github_client import create_draft_pr
         create_draft_pr("Org/Repo", "branch", "Title", "Body", [], assignee="nithin-br")
         pr.add_to_assignees.assert_called_once_with("nithin-br")
+
+    @patch("spectre_coding.github_client.time")
+    @patch("spectre_coding.github_client.Github")
+    def test_retries_on_503(self, MockGithub, mock_time):
+        pr = MagicMock()
+        pr.html_url = "https://github.com/Org/Repo/pull/14"
+        repo = MagicMock()
+        repo.get_labels.return_value = []
+        repo.create_pull.side_effect = [
+            GithubException(503, "Service unavailable", None),
+            pr,
+        ]
+        MockGithub.return_value.get_repo.return_value = repo
+
+        from spectre_coding.github_client import create_draft_pr
+        url = create_draft_pr("Org/Repo", "branch", "Title", "Body", [])
+        assert url == "https://github.com/Org/Repo/pull/14"
+        assert repo.create_pull.call_count == 2
