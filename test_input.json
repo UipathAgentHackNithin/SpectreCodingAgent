@@ -1,0 +1,7 @@
+{
+  "transaction_id": "INV-98766",
+  "process_name": "3201 Invoice Processing",
+  "diagnosis": "SAP login failed due to credential timeout on the authentication step",
+  "recommended_action": "Rotate SAP credentials and implement retry logic with exponential backoff",
+  "confidence": "High"
+}
