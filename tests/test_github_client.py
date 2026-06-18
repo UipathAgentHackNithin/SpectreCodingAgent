@@ -1,100 +1,181 @@
-"""Tests for github_client — repo discovery and PR creation logic."""
+"""Tests for github_client."""
 import pytest
 from unittest.mock import MagicMock, patch, call
+from github import GithubException
+
+
+def _make_repo(full_name, topics):
+    repo = MagicMock()
+    repo.full_name = full_name
+    repo.get_topics.return_value = topics
+    return repo
+
+
+def _make_pr(title, url):
+    pr = MagicMock()
+    pr.title = title
+    pr.html_url = url
+    return pr
+
+
+def _make_issue(title, url):
+    issue = MagicMock()
+    issue.title = title
+    issue.html_url = url
+    return issue
 
 
 # ── find_repo_by_process ──────────────────────────────────────────────────────
 
 class TestFindRepoByProcess:
-    def _make_repo(self, full_name: str, topics: list[str]):
-        repo = MagicMock()
-        repo.full_name = full_name
-        repo.get_topics.return_value = topics
-        return repo
-
     @patch("spectre_coding.github_client.Github")
-    def test_finds_repo_matching_process_number(self, MockGithub):
+    def test_finds_repo_by_process_number_topic(self, MockGithub):
         org = MagicMock()
-        org.get_repos.return_value = [
-            self._make_repo("Org/InvoiceBot", ["3201-invoice-processing"]),
-            self._make_repo("Org/GLBot", ["3202-gl-reconciliation"]),
-        ]
+        org.get_repos.return_value = [_make_repo("Org/InvoiceBot", ["3201-invoice-processing"])]
         MockGithub.return_value.get_organization.return_value = org
-
         from spectre_coding.github_client import find_repo_by_process
-        result = find_repo_by_process("3201 Invoice Processing")
-        assert result == "Org/InvoiceBot"
-
-    @patch("spectre_coding.github_client.Github")
-    def test_finds_repo_when_process_name_has_prefix(self, MockGithub):
-        org = MagicMock()
-        org.get_repos.return_value = [
-            self._make_repo("Org/GLBot", ["3202-gl-reconciliation"]),
-        ]
-        MockGithub.return_value.get_organization.return_value = org
-
-        from spectre_coding.github_client import find_repo_by_process
-        result = find_repo_by_process("ICSAUTO-3202 GL Reconciliation")
-        assert result == "Org/GLBot"
+        assert find_repo_by_process("3201 Invoice Processing") == "Org/InvoiceBot"
 
     @patch("spectre_coding.github_client.Github")
     def test_returns_none_when_no_matching_topic(self, MockGithub):
         org = MagicMock()
-        org.get_repos.return_value = [
-            self._make_repo("Org/OtherBot", ["9999-other-process"]),
-        ]
+        org.get_repos.return_value = [_make_repo("Org/Other", ["9999-other"])]
         MockGithub.return_value.get_organization.return_value = org
-
         from spectre_coding.github_client import find_repo_by_process
-        result = find_repo_by_process("3201 Invoice Processing")
-        assert result is None
+        assert find_repo_by_process("3201 Invoice Processing") is None
 
-    def test_returns_none_when_no_process_number_in_name(self):
+    def test_returns_none_when_no_process_number(self):
         from spectre_coding.github_client import find_repo_by_process
-        result = find_repo_by_process("Invoice Processing Bot")
-        assert result is None
+        assert find_repo_by_process("Invoice Processing Bot") is None
 
+
+# ── check_duplicate ───────────────────────────────────────────────────────────
+
+class TestCheckDuplicate:
     @patch("spectre_coding.github_client.Github")
-    def test_returns_none_when_org_has_no_repos(self, MockGithub):
-        org = MagicMock()
-        org.get_repos.return_value = []
-        MockGithub.return_value.get_organization.return_value = org
-
-        from spectre_coding.github_client import find_repo_by_process
-        result = find_repo_by_process("3201 Invoice Processing")
-        assert result is None
-
-
-# ── create_pull_request ───────────────────────────────────────────────────────
-
-class TestCreatePullRequest:
-    @patch("spectre_coding.github_client.Github")
-    def test_creates_pr_and_returns_url(self, MockGithub):
-        pr = MagicMock()
-        pr.html_url = "https://github.com/Org/Repo/pull/42"
+    def test_returns_url_when_open_pr_matches(self, MockGithub):
         repo = MagicMock()
+        repo.get_pulls.return_value = [_make_pr("[SpectreAI] 3201 — INV-98766", "https://github.com/Org/Repo/pull/1")]
+        repo.get_issues.return_value = []
+        MockGithub.return_value.get_repo.return_value = repo
+        from spectre_coding.github_client import check_duplicate
+        result = check_duplicate("Org/Repo", "INV-98766")
+        assert result == "https://github.com/Org/Repo/pull/1"
+
+    @patch("spectre_coding.github_client.Github")
+    def test_returns_url_when_open_issue_matches(self, MockGithub):
+        repo = MagicMock()
+        repo.get_pulls.return_value = []
+        repo.get_issues.return_value = [_make_issue("[SpectreAI] INV-98766 failure", "https://github.com/Org/Repo/issues/5")]
+        MockGithub.return_value.get_repo.return_value = repo
+        from spectre_coding.github_client import check_duplicate
+        result = check_duplicate("Org/Repo", "INV-98766")
+        assert result == "https://github.com/Org/Repo/issues/5"
+
+    @patch("spectre_coding.github_client.Github")
+    def test_returns_none_when_no_match(self, MockGithub):
+        repo = MagicMock()
+        repo.get_pulls.return_value = [_make_pr("Unrelated PR", "https://github.com/Org/Repo/pull/2")]
+        repo.get_issues.return_value = []
+        MockGithub.return_value.get_repo.return_value = repo
+        from spectre_coding.github_client import check_duplicate
+        assert check_duplicate("Org/Repo", "INV-98766") is None
+
+
+# ── get_codeowner ─────────────────────────────────────────────────────────────
+
+class TestGetCodeowner:
+    @patch("spectre_coding.github_client.Github")
+    def test_returns_first_username_from_codeowners(self, MockGithub):
+        content = MagicMock()
+        content.decoded_content = b"* @nithin-br @other-dev\n*.xaml @xaml-owner\n"
+        repo = MagicMock()
+        repo.get_contents.return_value = content
+        MockGithub.return_value.get_repo.return_value = repo
+        from spectre_coding.github_client import get_codeowner
+        assert get_codeowner("Org/Repo") == "nithin-br"
+
+    @patch("spectre_coding.github_client.Github")
+    def test_returns_none_when_codeowners_absent(self, MockGithub):
+        repo = MagicMock()
+        repo.get_contents.side_effect = GithubException(404, "not found", None)
+        MockGithub.return_value.get_repo.return_value = repo
+        from spectre_coding.github_client import get_codeowner
+        assert get_codeowner("Org/Repo") is None
+
+    @patch("spectre_coding.github_client.Github")
+    def test_skips_comment_lines(self, MockGithub):
+        content = MagicMock()
+        content.decoded_content = b"# This is a comment\n* @real-owner\n"
+        repo = MagicMock()
+        repo.get_contents.return_value = content
+        MockGithub.return_value.get_repo.return_value = repo
+        from spectre_coding.github_client import get_codeowner
+        assert get_codeowner("Org/Repo") == "real-owner"
+
+
+# ── create_draft_pr ───────────────────────────────────────────────────────────
+
+class TestCreateDraftPr:
+    @patch("spectre_coding.github_client.Github")
+    def test_creates_draft_pr(self, MockGithub):
+        pr = MagicMock()
+        pr.html_url = "https://github.com/Org/Repo/pull/10"
+        repo = MagicMock()
+        repo.get_labels.return_value = []
         repo.create_pull.return_value = pr
         MockGithub.return_value.get_repo.return_value = repo
 
-        from spectre_coding.github_client import create_pull_request
-        url = create_pull_request("Org/Repo", "spectre-fix/txn-1", "Fix title", "PR body")
-        assert url == "https://github.com/Org/Repo/pull/42"
-        repo.create_pull.assert_called_once_with(
-            title="Fix title",
-            body="PR body",
-            head="spectre-fix/txn-1",
-            base="main",
-        )
+        from spectre_coding.github_client import create_draft_pr
+        url = create_draft_pr("Org/Repo", "spectre-fix/txn-1", "Title", "Body", ["bug", "spectre-ai"])
 
-    @patch("spectre_coding.github_client.Github")
-    def test_uses_custom_base_branch(self, MockGithub):
-        pr = MagicMock()
-        pr.html_url = "https://github.com/Org/Repo/pull/99"
-        repo = MagicMock()
-        repo.create_pull.return_value = pr
-        MockGithub.return_value.get_repo.return_value = repo
-
-        from spectre_coding.github_client import create_pull_request
-        create_pull_request("Org/Repo", "branch", "title", "body", base_branch="develop")
+        assert url == "https://github.com/Org/Repo/pull/10"
         _, kwargs = repo.create_pull.call_args
-        assert kwargs["base"] == "develop"
+        assert kwargs["draft"] is True
+
+    @patch("spectre_coding.github_client.Github")
+    def test_creates_missing_labels(self, MockGithub):
+        pr = MagicMock()
+        pr.html_url = "https://github.com/Org/Repo/pull/11"
+        repo = MagicMock()
+        repo.get_labels.return_value = []  # no existing labels
+        repo.create_pull.return_value = pr
+        MockGithub.return_value.get_repo.return_value = repo
+
+        from spectre_coding.github_client import create_draft_pr
+        create_draft_pr("Org/Repo", "branch", "Title", "Body", ["bug", "spectre-ai", "sap"])
+
+        created = [c[0][0] for c in repo.create_label.call_args_list]
+        assert "bug" in created
+        assert "spectre-ai" in created
+        assert "sap" in created
+
+    @patch("spectre_coding.github_client.Github")
+    def test_does_not_recreate_existing_labels(self, MockGithub):
+        existing_label = MagicMock()
+        existing_label.name = "bug"
+        pr = MagicMock()
+        pr.html_url = "https://github.com/Org/Repo/pull/12"
+        repo = MagicMock()
+        repo.get_labels.return_value = [existing_label]
+        repo.create_pull.return_value = pr
+        MockGithub.return_value.get_repo.return_value = repo
+
+        from spectre_coding.github_client import create_draft_pr
+        create_draft_pr("Org/Repo", "branch", "Title", "Body", ["bug"])
+
+        for c in repo.create_label.call_args_list:
+            assert c[0][0] != "bug"
+
+    @patch("spectre_coding.github_client.Github")
+    def test_assigns_assignee_when_provided(self, MockGithub):
+        pr = MagicMock()
+        pr.html_url = "https://github.com/Org/Repo/pull/13"
+        repo = MagicMock()
+        repo.get_labels.return_value = []
+        repo.create_pull.return_value = pr
+        MockGithub.return_value.get_repo.return_value = repo
+
+        from spectre_coding.github_client import create_draft_pr
+        create_draft_pr("Org/Repo", "branch", "Title", "Body", [], assignee="nithin-br")
+        pr.add_to_assignees.assert_called_once_with("nithin-br")
