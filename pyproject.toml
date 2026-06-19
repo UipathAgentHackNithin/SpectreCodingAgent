@@ -1,6 +1,6 @@
 [project]
 name = "SpectreCodingAgent"
-version = "1.0.0"
+version = "1.0.1"
 description = "SpectreAI - Autonomous RPA bot code fix agent"
 authors = [{ name = "Nithin BR" }]
 requires-python = ">=3.10"

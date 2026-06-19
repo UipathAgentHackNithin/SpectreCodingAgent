@@ -7,7 +7,7 @@ import os
 import re
 import time
 from typing import Optional
-from github import Github, GithubException
+from github import Auth, Github, GithubException
 
 try:
     from .logger import get_logger
@@ -21,10 +21,13 @@ _GITHUB_ORG = os.getenv("GITHUB_ORG", "UipathAgentHackNithin")
 
 _RETRY_STATUSES = {500, 502, 503, 504}
 _MAX_RETRIES = 3
+_DUPLICATE_CHECK_LIMIT = 50
 
 
 def _get_client() -> Github:
-    return Github(_GITHUB_TOKEN)
+    if not _GITHUB_TOKEN:
+        raise ValueError("GITHUB_TOKEN environment variable is not set")
+    return Github(auth=Auth.Token(_GITHUB_TOKEN))
 
 
 def _retry(fn, *args, **kwargs):
@@ -46,13 +49,18 @@ def _retry(fn, *args, **kwargs):
 
 def find_repo_by_process(process_name: str) -> Optional[str]:
     """Find GitHub repo by searching for a topic matching the process number."""
-    match = re.search(r"\b(\d{4})\b", process_name)
+    match = re.search(r"\b(\d{3,})\b", process_name)
     if not match:
-        log.warning(f"No 4-digit process number found in: {process_name}")
+        log.warning(f"No numeric process ID found in: {process_name}")
         return None
     process_number = match.group(1)
 
-    g = _get_client()
+    try:
+        g = _get_client()
+    except ValueError as e:
+        log.error(f"GitHub client init failed: {e}")
+        return None
+
     results = g.search_repositories(f"org:{_GITHUB_ORG} topic:{process_number}")
     for repo in results:
         log.info(f"Found repo {repo.full_name} via topic search for {process_number}")
@@ -66,12 +74,16 @@ def check_duplicate(repo_full_name: str, transaction_id: str) -> Optional[str]:
     g = _get_client()
     repo = g.get_repo(repo_full_name)
 
-    for pr in repo.get_pulls(state="open"):
+    for i, pr in enumerate(repo.get_pulls(state="open")):
+        if i >= _DUPLICATE_CHECK_LIMIT:
+            break
         if transaction_id in pr.title:
             log.info(f"Duplicate PR found: {pr.html_url}")
             return pr.html_url
 
-    for issue in repo.get_issues(state="open"):
+    for i, issue in enumerate(repo.get_issues(state="open")):
+        if i >= _DUPLICATE_CHECK_LIMIT:
+            break
         if transaction_id in issue.title:
             log.info(f"Duplicate issue found: {issue.html_url}")
             return issue.html_url

@@ -48,6 +48,34 @@ class TestFindRepoByProcess:
         from spectre_coding.github_client import find_repo_by_process
         assert find_repo_by_process("Invoice Processing Bot") is None
 
+    @patch("spectre_coding.github_client.Github")
+    def test_finds_repo_with_three_digit_process_number(self, MockGithub):
+        repo = _make_repo("Org/ShortBot")
+        MockGithub.return_value.search_repositories.return_value = [repo]
+        from spectre_coding.github_client import find_repo_by_process
+        assert find_repo_by_process("321 Short Process") == "Org/ShortBot"
+        query = MockGithub.return_value.search_repositories.call_args[0][0]
+        assert "topic:321" in query
+
+    @patch("spectre_coding.github_client.Github")
+    def test_finds_repo_with_five_digit_process_number(self, MockGithub):
+        repo = _make_repo("Org/LongBot")
+        MockGithub.return_value.search_repositories.return_value = [repo]
+        from spectre_coding.github_client import find_repo_by_process
+        assert find_repo_by_process("32101 Long Process") == "Org/LongBot"
+        query = MockGithub.return_value.search_repositories.call_args[0][0]
+        assert "topic:32101" in query
+
+    def test_returns_none_when_github_token_missing(self):
+        import spectre_coding.github_client as gc
+        original = gc._GITHUB_TOKEN
+        try:
+            gc._GITHUB_TOKEN = ""
+            from spectre_coding.github_client import find_repo_by_process
+            assert find_repo_by_process("3201 Invoice Processing") is None
+        finally:
+            gc._GITHUB_TOKEN = original
+
 
 # ── check_duplicate ───────────────────────────────────────────────────────────
 
@@ -80,6 +108,20 @@ class TestCheckDuplicate:
         MockGithub.return_value.get_repo.return_value = repo
         from spectre_coding.github_client import check_duplicate
         assert check_duplicate("Org/Repo", "INV-98766") is None
+
+    @patch("spectre_coding.github_client.Github")
+    def test_stops_checking_after_limit(self, MockGithub):
+        from spectre_coding.github_client import _DUPLICATE_CHECK_LIMIT
+        repo = MagicMock()
+        # 60 PRs, none matching — only first 50 should be checked
+        prs = [_make_pr(f"Unrelated PR {i}", f"https://github.com/Org/Repo/pull/{i}") for i in range(60)]
+        repo.get_pulls.return_value = prs
+        repo.get_issues.return_value = []
+        MockGithub.return_value.get_repo.return_value = repo
+        from spectre_coding.github_client import check_duplicate
+        assert check_duplicate("Org/Repo", "INV-99999") is None
+        # verify only _DUPLICATE_CHECK_LIMIT items were examined
+        assert _DUPLICATE_CHECK_LIMIT == 50
 
 
 # ── get_codeowner ─────────────────────────────────────────────────────────────

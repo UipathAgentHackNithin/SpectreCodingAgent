@@ -1,12 +1,13 @@
 {
   "$schema": "https://cloud.uipath.com/draft/2024-12/uipath",
+  "id": "69977dd8-f8d4-4f39-8c2b-b5b69375009d",
   "runtimeOptions": {
     "isConversational": false
   },
   "packOptions": {
     "fileExtensionsIncluded": [],
     "filesIncluded": [],
-    "filesExcluded": [],
+    "filesExcluded": ["refresh_token.ps1"],
     "directoriesExcluded": [],
     "includeUvLock": true
   },

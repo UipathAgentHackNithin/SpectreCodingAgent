@@ -14,6 +14,7 @@ import os
 import time
 import xml.etree.ElementTree as ET
 from pydantic import BaseModel
+from uipath.platform import UiPath
 
 try:
     from .logger import get_logger
@@ -40,6 +41,20 @@ except ImportError:
 
 log = get_logger("spectre.coding_agent")
 
+_CG_FOLDER_PATH = "Shared/Specter"
+_SUPPORT_HANDLE_FALLBACK = "<!subteam^S0BBTE9DA0N>"
+
+
+def _get_support_handle(sdk: UiPath) -> str:
+    try:
+        asset = sdk.assets.retrieve("SPECTRE_SUPPORT_HANDLE", folder_path=_CG_FOLDER_PATH)
+        value = getattr(asset, "string_value", None) or getattr(asset, "StringValue", None) or getattr(asset, "value", None)
+        if value:
+            return value
+    except Exception as e:
+        log.warning(f"Could not read SPECTRE_SUPPORT_HANDLE asset: {e}")
+    return _SUPPORT_HANDLE_FALLBACK
+
 
 class FixIn(BaseModel):
     transaction_id: str
@@ -65,12 +80,17 @@ class FixOut(BaseModel):
 async def fix(input: FixIn) -> FixOut:
     log.info(f"SpectreCodingAgent — txn={input.transaction_id} process={input.process_name}")
 
+    sdk = UiPath()
+    support_handle = _get_support_handle(sdk)
+
     # ── 1. Find repo ──────────────────────────────────────────────────────────
     repo_full_name = find_repo_by_process(input.process_name)
     if not repo_full_name:
-        msg = f"No GitHub repo found for process: {input.process_name}"
-        log.warning(msg)
-        return _empty_out(msg)
+        log.warning(f"No GitHub repo found for process: {input.process_name}")
+        return _empty_out(
+            f"SpectreAI could not find a code repository for '{input.process_name}'. "
+            f"Please contact {support_handle} for manual investigation.",
+        )
 
     # ── 2. Duplicate check ────────────────────────────────────────────────────
     existing_url = check_duplicate(repo_full_name, input.transaction_id)
@@ -84,11 +104,25 @@ async def fix(input: FixIn) -> FixOut:
             message=f"Duplicate found: {existing_url}",
         )
 
-    llm_token, base_url = get_llm_token()
+    try:
+        llm_token, base_url = get_llm_token()
+    except Exception as e:
+        log.error(f"LLM token acquisition failed: {e}")
+        return _empty_out(
+            f"SpectreAI encountered an internal error and could not run. "
+            f"Please contact {support_handle} if this persists.",
+        )
 
     # ── 3. Fetch XAML listing ─────────────────────────────────────────────────
     branch_name = f"spectre-fix/{input.transaction_id.lower()}"
-    ensure_branch(repo_full_name, branch_name)
+    try:
+        ensure_branch(repo_full_name, branch_name)
+    except Exception as e:
+        log.error(f"Could not create branch '{branch_name}' in '{repo_full_name}': {e}")
+        return _empty_out(
+            f"SpectreAI could not access the code repository for '{input.process_name}'. "
+            f"Please contact {support_handle} for manual investigation.",
+        )
 
     scan_results = fetch_xaml_listing(repo_full_name)
     repo_summary = build_repo_summary(scan_results)
@@ -113,12 +147,21 @@ async def fix(input: FixIn) -> FixOut:
             fix_result = _no_fix_result("Candidate files identified but could not be read", "Low")
         else:
             # ── 6. LLM call 2: analyse and fix ────────────────────────────────
-            fix_result = await analyse_and_fix(
-                llm_token, base_url,
-                input.diagnosis, input.recommended_action,
-                candidate_files,
-            )
+            try:
+                fix_result = await analyse_and_fix(
+                    llm_token, base_url,
+                    input.diagnosis, input.recommended_action,
+                    candidate_files,
+                )
+            except Exception as e:
+                log.error(f"LLM fix analysis failed: {e}")
+                fix_result = _no_fix_result(f"AI fix analysis failed — {e}", "Low")
+
             log.info(f"Fix analysis: can_fix={fix_result.get('can_fix')} confidence={fix_result.get('confidence')}")
+
+            # Normalise confidence casing — LLM may return "high"/"medium"/"low"
+            if "confidence" in fix_result:
+                fix_result["confidence"] = fix_result["confidence"].capitalize()
 
             # Apply patch if possible
             if fix_result.get("can_fix") and fix_result.get("original_snippet"):
@@ -136,7 +179,10 @@ async def fix(input: FixIn) -> FixOut:
                     log.warning(f"replacement_snippet is not valid XML — patch skipped: {xml_err}")
                     fix_result["_actually_patched"] = False
                     fix_result["target_file"] = ""
-                    _commit_report(repo_full_name, branch_name, input, fix_result)
+                    try:
+                        _commit_report(repo_full_name, branch_name, input, fix_result)
+                    except Exception as ce:
+                        log.warning(f"Report commit failed (continuing to PR): {ce}")
 
                 if replacement_valid:
                     if original_content and original in original_content:
@@ -150,9 +196,15 @@ async def fix(input: FixIn) -> FixOut:
                         fix_result["_actually_patched"] = False
                         fix_result["target_file"] = ""
                         log.warning("original_snippet not found verbatim — patch skipped")
-                        _commit_report(repo_full_name, branch_name, input, fix_result)
+                        try:
+                            _commit_report(repo_full_name, branch_name, input, fix_result)
+                        except Exception as ce:
+                            log.warning(f"Report commit failed (continuing to PR): {ce}")
             else:
-                _commit_report(repo_full_name, branch_name, input, fix_result)
+                try:
+                    _commit_report(repo_full_name, branch_name, input, fix_result)
+                except Exception as ce:
+                    log.warning(f"Report commit failed (continuing to PR): {ce}")
 
     # ── Build labels ──────────────────────────────────────────────────────────
     llm_confidence = fix_result.get("confidence", "Low")
@@ -168,7 +220,14 @@ async def fix(input: FixIn) -> FixOut:
     actually_patched = fix_result.get("_actually_patched", False)
     pr_title = _build_pr_title(input, fix_result, actually_patched)
     pr_body = _build_pr_body(input, fix_result, actually_patched, selection_confidence, branch_name, patch_skip_reason)
-    pr_url = create_draft_pr(repo_full_name, branch_name, pr_title, pr_body, labels, assignee)
+    try:
+        pr_url = create_draft_pr(repo_full_name, branch_name, pr_title, pr_body, labels, assignee)
+    except Exception as e:
+        log.error(f"PR creation failed: {e}")
+        return _empty_out(
+            f"SpectreAI analysed the issue but could not submit the fix for review. "
+            f"Please contact {support_handle} for manual investigation.",
+        )
 
     log.info(f"Draft PR opened: {pr_url}")
     return FixOut(

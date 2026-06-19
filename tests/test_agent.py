@@ -26,6 +26,13 @@ _P_REPORT = "spectre_coding.agent._commit_report"
 _P_PR = "spectre_coding.agent.create_draft_pr"
 _P_OWNER = "spectre_coding.agent.get_codeowner"
 _P_AUTH = "spectre_coding.agent.get_llm_token"
+_P_SDK = "spectre_coding.agent.UiPath"
+
+
+def _mock_sdk():
+    sdk = MagicMock()
+    sdk.assets.retrieve.return_value = MagicMock(string_value="<!subteam^S0BBTE9DA0N>")
+    return sdk
 
 
 def _selection(candidates, confidence="High"):
@@ -51,15 +58,20 @@ def _fix_result(can_fix=True, patched=True, confidence="High", issue_type="ui-au
 class TestAgentFlow:
     @pytest.mark.asyncio
     async def test_returns_early_when_repo_not_found(self):
-        with patch(_P_FIND, return_value=None), patch(_P_AUTH, return_value=("tok", "http://x")):
+        with (
+            patch(_P_SDK, return_value=_mock_sdk()),
+            patch(_P_FIND, return_value=None),
+            patch(_P_AUTH, return_value=("tok", "http://x")),
+        ):
             from spectre_coding.agent import fix
             result = await fix(FIX_IN)
         assert result.pr_url == ""
-        assert "No GitHub repo found" in result.message
+        assert "could not find a code repository" in result.message
 
     @pytest.mark.asyncio
     async def test_returns_duplicate_url_when_duplicate_found(self):
         with (
+            patch(_P_SDK, return_value=_mock_sdk()),
             patch(_P_FIND, return_value="Org/Bot"),
             patch(_P_DUP, return_value="https://github.com/Org/Bot/pull/5"),
             patch(_P_AUTH, return_value=("tok", "http://x")),
@@ -72,6 +84,7 @@ class TestAgentFlow:
     @pytest.mark.asyncio
     async def test_opens_draft_pr_when_fix_applied(self):
         with (
+            patch(_P_SDK, return_value=_mock_sdk()),
             patch(_P_FIND, return_value="Org/Bot"),
             patch(_P_DUP, return_value=None),
             patch(_P_AUTH, return_value=("tok", "http://x")),
@@ -99,6 +112,7 @@ class TestAgentFlow:
             return "https://github.com/Org/Bot/pull/2"
 
         with (
+            patch(_P_SDK, return_value=_mock_sdk()),
             patch(_P_FIND, return_value="Org/Bot"),
             patch(_P_DUP, return_value=None),
             patch(_P_AUTH, return_value=("tok", "http://x")),
@@ -123,6 +137,7 @@ class TestAgentFlow:
             return "https://github.com/Org/Bot/pull/3"
 
         with (
+            patch(_P_SDK, return_value=_mock_sdk()),
             patch(_P_FIND, return_value="Org/Bot"),
             patch(_P_DUP, return_value=None),
             patch(_P_AUTH, return_value=("tok", "http://x")),
@@ -143,6 +158,7 @@ class TestAgentFlow:
     @pytest.mark.asyncio
     async def test_target_activity_propagated_to_fixout(self):
         with (
+            patch(_P_SDK, return_value=_mock_sdk()),
             patch(_P_FIND, return_value="Org/Bot"),
             patch(_P_DUP, return_value=None),
             patch(_P_AUTH, return_value=("tok", "http://x")),
@@ -170,6 +186,7 @@ class TestPatchApply:
             committed["content"] = content
 
         with (
+            patch(_P_SDK, return_value=_mock_sdk()),
             patch(_P_FIND, return_value="Org/Bot"),
             patch(_P_DUP, return_value=None),
             patch(_P_AUTH, return_value=("tok", "http://x")),
@@ -199,6 +216,7 @@ class TestPatchApply:
         reported = []
 
         with (
+            patch(_P_SDK, return_value=_mock_sdk()),
             patch(_P_FIND, return_value="Org/Bot"),
             patch(_P_DUP, return_value=None),
             patch(_P_AUTH, return_value=("tok", "http://x")),
@@ -228,6 +246,7 @@ class TestPatchApply:
         reported = []
 
         with (
+            patch(_P_SDK, return_value=_mock_sdk()),
             patch(_P_FIND, return_value="Org/Bot"),
             patch(_P_DUP, return_value=None),
             patch(_P_AUTH, return_value=("tok", "http://x")),
@@ -313,3 +332,126 @@ class TestPrBodyBuilders:
         fr["_actually_patched"] = False
         body = _build_pr_body(FIX_IN, fr, patched=False, patch_skip_reason="some reason here")
         assert "some reason here" in body
+
+
+class TestFailurePaths:
+    @pytest.mark.asyncio
+    async def test_llm_token_failure_returns_empty_out_with_support_handle(self):
+        with (
+            patch(_P_SDK, return_value=_mock_sdk()),
+            patch(_P_FIND, return_value="Org/Bot"),
+            patch(_P_DUP, return_value=None),
+            patch(_P_AUTH, side_effect=RuntimeError("token expired")),
+        ):
+            from spectre_coding.agent import fix
+            result = await fix(FIX_IN)
+        assert result.pr_url == ""
+        assert result.fixed is False
+        assert "@rpa-support" in result.message or "subteam" in result.message
+
+    @pytest.mark.asyncio
+    async def test_ensure_branch_failure_returns_empty_out_with_support_handle(self):
+        with (
+            patch(_P_SDK, return_value=_mock_sdk()),
+            patch(_P_FIND, return_value="Org/Bot"),
+            patch(_P_DUP, return_value=None),
+            patch(_P_AUTH, return_value=("tok", "http://x")),
+            patch(_P_ENSURE_BRANCH, side_effect=Exception("branch error")),
+        ):
+            from spectre_coding.agent import fix
+            result = await fix(FIX_IN)
+        assert result.pr_url == ""
+        assert result.fixed is False
+        assert "could not access the code repository" in result.message
+
+    @pytest.mark.asyncio
+    async def test_analyse_and_fix_failure_opens_report_only_pr(self):
+        with (
+            patch(_P_SDK, return_value=_mock_sdk()),
+            patch(_P_FIND, return_value="Org/Bot"),
+            patch(_P_DUP, return_value=None),
+            patch(_P_AUTH, return_value=("tok", "http://x")),
+            patch(_P_ENSURE_BRANCH),
+            patch(_P_FETCH, return_value=[{"path": "Process.xaml", "size": 100}]),
+            patch(_P_SUMMARY, return_value="summary"),
+            patch(_P_SELECT, AsyncMock(return_value=_selection(["Process.xaml"]))),
+            patch(_P_FETCH_CONTENTS, return_value={"Process.xaml": "<xml/>"}),
+            patch(_P_ANALYSE, AsyncMock(side_effect=RuntimeError("llm down"))),
+            patch(_P_REPORT),
+            patch(_P_OWNER, return_value=None),
+            patch(_P_PR, return_value="https://github.com/Org/Bot/pull/9"),
+        ):
+            from spectre_coding.agent import fix
+            result = await fix(FIX_IN)
+        assert result.fixed is False
+        assert result.pr_url == "https://github.com/Org/Bot/pull/9"
+
+    @pytest.mark.asyncio
+    async def test_create_draft_pr_failure_returns_empty_out_with_support_handle(self):
+        with (
+            patch(_P_SDK, return_value=_mock_sdk()),
+            patch(_P_FIND, return_value="Org/Bot"),
+            patch(_P_DUP, return_value=None),
+            patch(_P_AUTH, return_value=("tok", "http://x")),
+            patch(_P_ENSURE_BRANCH),
+            patch(_P_FETCH, return_value=[]),
+            patch(_P_SUMMARY, return_value=""),
+            patch(_P_SELECT, AsyncMock(return_value=_selection([]))),
+            patch(_P_REPORT),
+            patch(_P_OWNER, return_value=None),
+            patch(_P_PR, side_effect=Exception("GitHub 503")),
+        ):
+            from spectre_coding.agent import fix
+            result = await fix(FIX_IN)
+        assert result.pr_url == ""
+        assert result.fixed is False
+        assert "could not submit the fix" in result.message
+
+    @pytest.mark.asyncio
+    async def test_commit_report_failure_does_not_crash_job(self):
+        with (
+            patch(_P_SDK, return_value=_mock_sdk()),
+            patch(_P_FIND, return_value="Org/Bot"),
+            patch(_P_DUP, return_value=None),
+            patch(_P_AUTH, return_value=("tok", "http://x")),
+            patch(_P_ENSURE_BRANCH),
+            patch(_P_FETCH, return_value=[{"path": "Process.xaml", "size": 100}]),
+            patch(_P_SUMMARY, return_value="summary"),
+            patch(_P_SELECT, AsyncMock(return_value=_selection(["Process.xaml"]))),
+            patch(_P_FETCH_CONTENTS, return_value={"Process.xaml": "<xml/>"}),
+            patch(_P_ANALYSE, AsyncMock(return_value=_fix_result(can_fix=False, confidence="Low"))),
+            patch(_P_REPORT, side_effect=Exception("commit failed")),
+            patch(_P_OWNER, return_value=None),
+            patch(_P_PR, return_value="https://github.com/Org/Bot/pull/10"),
+        ):
+            from spectre_coding.agent import fix
+            result = await fix(FIX_IN)
+        assert result.pr_url == "https://github.com/Org/Bot/pull/10"
+
+    @pytest.mark.asyncio
+    async def test_confidence_normalized_from_lowercase(self):
+        labels_used = []
+
+        def capture_pr(repo, branch, title, body, labels, assignee=None, **kw):
+            labels_used.extend(labels)
+            return "https://github.com/Org/Bot/pull/11"
+
+        with (
+            patch(_P_SDK, return_value=_mock_sdk()),
+            patch(_P_FIND, return_value="Org/Bot"),
+            patch(_P_DUP, return_value=None),
+            patch(_P_AUTH, return_value=("tok", "http://x")),
+            patch(_P_ENSURE_BRANCH),
+            patch(_P_FETCH, return_value=[{"path": "Process.xaml", "size": 100}]),
+            patch(_P_SUMMARY, return_value="summary"),
+            patch(_P_SELECT, AsyncMock(return_value=_selection(["Process.xaml"]))),
+            patch(_P_FETCH_CONTENTS, return_value={"Process.xaml": "<old/>"}),
+            patch(_P_ANALYSE, AsyncMock(return_value=_fix_result(confidence="high"))),
+            patch(_P_COMMIT),
+            patch(_P_OWNER, return_value=None),
+            patch(_P_PR, side_effect=capture_pr),
+        ):
+            from spectre_coding.agent import fix
+            result = await fix(FIX_IN)
+        assert result.llm_confidence == "High"
+        assert "needs-human-review" not in labels_used

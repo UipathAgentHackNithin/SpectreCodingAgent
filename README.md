@@ -69,7 +69,7 @@ SpectreInvestigationAgent --> Structured Diagnosis (JSON)
 | Field | Type | Description |
 |---|---|---|
 | `transaction_id` | str | Orchestrator transaction ID (e.g. `INV-98766`) |
-| `process_name` | str | Process name including 4-digit number (e.g. `3201 Invoice Processing`) |
+| `process_name` | str | Process name including a numeric ID of 3+ digits (e.g. `3201 Invoice Processing`) |
 | `diagnosis` | str | Structured diagnosis from SpectreInvestigationAgent |
 | `recommended_action` | str | Suggested fix from SpectreInvestigationAgent |
 | `confidence` | str | Investigation confidence: `High / Medium / Low` |
@@ -119,6 +119,31 @@ uv run pytest
 | `SPECTRE_DEFAULT_ASSIGNEE` | No | Fallback PR assignee if no CODEOWNERS (default: `brnithin33-AI`) |
 
 > On robot runtime, set these as Orchestrator robot environment variables — `.env` is not available.
+
+---
+
+## Orchestrator Assets
+
+| Asset | Folder | Description |
+|---|---|---|
+| `SPECTRE_SUPPORT_HANDLE` | `Shared/Specter` | Slack user group tag shown in failure messages (e.g. `<!subteam^S0BBTE9DA0N>`). Falls back to hardcoded `@rpa-support` handle if not set. |
+
+---
+
+## Non-Happy Path Handling
+
+| Scenario | Behaviour |
+|---|---|
+| `GITHUB_TOKEN` not set | `find_repo_by_process` returns `None` → clean `FixOut` with support handle message |
+| No repo found for process name | Returns `FixOut(fixed=False)` with user-facing message including support handle |
+| Duplicate PR/issue exists | Returns existing URL, `is_duplicate=True`, no new PR created |
+| LLM token unavailable | Returns `FixOut(fixed=False)` with support handle message |
+| Branch creation fails | Returns `FixOut(fixed=False)` with support handle message |
+| LLM fix analysis fails | Falls through to report-only PR — job does not crash |
+| `_commit_report` fails | Warning logged, PR creation continues — job does not crash |
+| PR creation fails | Returns `FixOut(fixed=False)` with support handle message |
+| LLM returns lowercase confidence | Normalised via `.capitalize()` before label assignment |
+| Duplicate check on busy repo | Capped at 50 open PRs and 50 open issues to avoid rate limits |
 
 ---
 
