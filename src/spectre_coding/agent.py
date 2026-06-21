@@ -6,11 +6,14 @@ SpectreCodingAgent — orchestrates the full fix flow.
 3. Fetch all XAML files via GitHub API (no clone)
 4. LLM call 1: select candidate files from repo summary
 5. LLM call 2: analyse candidates and produce surgical fix
-6. Apply patch if possible, commit via API
+6. Apply patches (one per file) and commit via API
 7. Open DRAFT PR with labels + assignee
 """
 import asyncio
+import json
 import os
+import re
+import requests
 import time
 import xml.etree.ElementTree as ET
 from pydantic import BaseModel
@@ -18,23 +21,23 @@ from uipath.platform import UiPath
 
 try:
     from .logger import get_logger
-    from .auth import get_llm_token
+    from .auth import get_llm_token, get_pat
     from .github_client import (
         find_repo_by_process, check_duplicate,
         fetch_xaml_listing, fetch_xaml_contents,
         commit_file_to_branch, ensure_branch,
-        create_draft_pr, get_codeowner, _commit_report,
+        create_draft_pr, get_codeowner, get_last_committer, _commit_report,
     )
     from .xaml_scanner import build_repo_summary
     from .llm import select_target_files, analyse_and_fix
 except ImportError:
     from logger import get_logger
-    from auth import get_llm_token
+    from auth import get_llm_token, get_pat
     from github_client import (
         find_repo_by_process, check_duplicate,
         fetch_xaml_listing, fetch_xaml_contents,
         commit_file_to_branch, ensure_branch,
-        create_draft_pr, get_codeowner, _commit_report,
+        create_draft_pr, get_codeowner, get_last_committer, _commit_report,
     )
     from xaml_scanner import build_repo_summary
     from llm import select_target_files, analyse_and_fix
@@ -42,6 +45,8 @@ except ImportError:
 log = get_logger("spectre.coding_agent")
 
 _CG_FOLDER_PATH = "Shared/Specter"
+_CG_INDEX_NAME = "SpectreKB"
+_CG_BUCKET_NAME = "Spectre AI"
 _SUPPORT_HANDLE_FALLBACK = "<!subteam^S0BBTE9DA0N>"
 
 
@@ -54,6 +59,56 @@ def _get_support_handle(sdk: UiPath) -> str:
     except Exception as e:
         log.warning(f"Could not read SPECTRE_SUPPORT_HANDLE asset: {e}")
     return _SUPPORT_HANDLE_FALLBACK
+
+
+def _search_kb_for_similar(sdk: UiPath, query: str) -> str:
+    """Search SpectreKB for a similar past fix. Returns a summary string or empty string."""
+    try:
+        results = sdk.context_grounding.search(
+            name=_CG_INDEX_NAME,
+            query=query,
+            number_of_results=1,
+            folder_path=_CG_FOLDER_PATH,
+        )
+        if results:
+            top = results[0]
+            content = getattr(top, "text", None) or getattr(top, "content", None) or str(top)
+            log.info(f"KB similar fix found: {content[:100]}")
+            return content
+    except Exception as e:
+        log.warning(f"KB similarity search failed: {e}")
+    return ""
+
+
+def _ingest_fix_to_kb(sdk: UiPath, input: "FixIn", fix_result: dict, pr_url: str, patched: bool) -> None:
+    """Upload coding agent fix outcome to SpectreKB bucket and trigger re-ingestion."""
+    try:
+        safe_process = input.process_name.replace(" ", "_")
+        file_name = f"coding_{safe_process}_{input.transaction_id}.json"
+        record = {
+            "transaction_id": input.transaction_id,
+            "process_name": input.process_name,
+            "issue_type": fix_result.get("issue_type_label", "unknown"),
+            "failure_category": fix_result.get("failure_category", "unknown"),
+            "description": input.diagnosis,
+            "pr_url": pr_url,
+            "patch_mode": fix_result.get("patch_mode", "none"),
+            "fixed": patched,
+            "llm_confidence": fix_result.get("confidence", "Low"),
+            "recommended_action": input.recommended_action,
+        }
+        sdk.buckets.upload(
+            name=_CG_BUCKET_NAME,
+            blob_file_path=file_name,
+            content=json.dumps(record, indent=2),
+            content_type="application/json",
+            folder_path=_CG_FOLDER_PATH,
+        )
+        log.info(f"KB ingest: uploaded {file_name} to '{_CG_BUCKET_NAME}'")
+        sdk.context_grounding.ingest_by_name(name=_CG_INDEX_NAME, folder_path=_CG_FOLDER_PATH)
+        log.info("KB ingest: SpectreKB re-ingestion triggered")
+    except Exception as e:
+        log.warning(f"KB fix ingest failed (non-fatal): {e}")
 
 
 class FixIn(BaseModel):
@@ -69,18 +124,156 @@ class FixOut(BaseModel):
     pr_url: str
     repo_full_name: str
     branch_name: str
-    file_changed: str
-    target_activity: str
+    files_changed: list
     fix_description: str
     llm_confidence: str
     is_duplicate: bool
     message: str
 
 
+def _apply_fix_entry(entry: dict, candidate_files: dict, repo_full_name: str, branch_name: str) -> tuple:
+    """
+    Apply a single fix entry. Returns (patched: bool, skip_reason: str).
+    """
+    patch_mode = entry.get("patch_mode", "snippet")
+    target_file = entry.get("target_file", "")
+    commit_msg = entry.get("commit_message") or "[SpectreAI] Fix"
+
+    if patch_mode in ("line_range", "multi_range"):
+        original_content = candidate_files.get(target_file)
+        if not original_content:
+            return False, f"content of {target_file} not available"
+
+        ns_decls = " ".join(re.findall(r'xmlns(?::\w+)?="[^"]*"', original_content))
+
+        # Normalise to a list of hunks regardless of mode
+        if patch_mode == "line_range":
+            hunks = [{"start_line": entry.get("start_line"), "end_line": entry.get("end_line"),
+                      "replacement_lines": entry.get("replacement_lines", "")}]
+        else:
+            hunks = entry.get("hunks", [])
+            if not hunks:
+                return False, "multi_range fix has empty hunks list"
+
+        # Validate all hunks before touching the file
+        for i, hunk in enumerate(hunks):
+            if hunk.get("start_line") is None or hunk.get("end_line") is None:
+                return False, f"hunk {i} missing start_line or end_line"
+            try:
+                ET.fromstring(f"<_r {ns_decls}>{hunk.get('replacement_lines', '')}</_r>")
+            except ET.ParseError as xml_err:
+                return False, f"hunk {i} replacement_lines is not valid XML: {xml_err}"
+
+        lines = original_content.splitlines(keepends=True)
+        total = len(lines)
+
+        # Apply hunks in reverse order so earlier line numbers stay valid
+        for hunk in sorted(hunks, key=lambda h: int(h["start_line"]), reverse=True):
+            s = int(hunk["start_line"]) - 1
+            e = int(hunk["end_line"])
+            if s < 0 or e > total or s >= e:
+                return False, f"line range {hunk['start_line']}–{hunk['end_line']} out of bounds (file has {total} lines)"
+
+            ending = "\r\n" if lines[e - 1].endswith("\r\n") else "\n" if lines[e - 1].endswith("\n") else ""
+            replacement_block = hunk["replacement_lines"].rstrip("\r\n") + ending
+            lines = lines[:s] + [replacement_block] + lines[e:]
+
+        patched_content = "".join(lines)
+        commit_file_to_branch(repo_full_name, branch_name, target_file, patched_content, commit_msg)
+        hunk_summary = f"{len(hunks)} hunk(s)" if patch_mode == "multi_range" else f"lines {entry.get('start_line')}–{entry.get('end_line')}"
+        log.info(f"{patch_mode} patch committed to {target_file} ({hunk_summary})")
+        return True, ""
+
+    elif patch_mode == "full_rewrite" and entry.get("rewritten_xaml"):
+        rewritten = entry["rewritten_xaml"]
+        try:
+            ET.fromstring(rewritten.encode("utf-8"))
+        except ET.ParseError as xml_err:
+            reason = f"rewritten_xaml is not well-formed XML: {xml_err}"
+            log.warning(f"{target_file}: {reason}")
+            return False, reason
+
+        commit_file_to_branch(repo_full_name, branch_name, target_file, rewritten, commit_msg)
+        log.info(f"Full XAML rewrite committed to {target_file} on {branch_name}")
+        return True, ""
+
+    return False, "no patchable content in fix entry"
+
+
+def _update_env_file(new_refresh_token: str) -> None:
+    """Persist the rotated refresh token back to .env so subsequent local runs don't hit invalid_grant."""
+    env_path = os.path.join(os.path.dirname(__file__), "..", "..", ".env")
+    env_path = os.path.normpath(env_path)
+    if not os.path.exists(env_path):
+        return
+    try:
+        lines = open(env_path, encoding="utf-8").readlines()
+        lines = [l for l in lines if not l.startswith("UIPATH_REFRESH_TOKEN=")]
+        lines.append(f"UIPATH_REFRESH_TOKEN={new_refresh_token}\n")
+        with open(env_path, "w", encoding="utf-8") as f:
+            f.writelines(lines)
+        log.info(".env updated with rotated refresh token")
+    except Exception as e:
+        log.warning(f"Could not update .env with rotated refresh token: {e}")
+
+
+def _writeback_refresh_token(pat: str, base_url: str, new_refresh_token: str) -> None:
+    """Update SPECTRE_REFRESH_TOKEN asset using the PAT directly (bypasses robot permission limits)."""
+    headers = {
+        "Authorization": f"Bearer {pat}",
+        "Content-Type": "application/json",
+        "X-UIPATH-FolderPath": _CG_FOLDER_PATH,
+    }
+    lookup_resp = requests.get(
+        f"{base_url}/orchestrator_/odata/Assets?$filter=Name eq 'SPECTRE_REFRESH_TOKEN'",
+        headers=headers,
+        timeout=10,
+    )
+    lookup_resp.raise_for_status()
+    items = lookup_resp.json().get("value", [])
+    if not items:
+        raise ValueError("SPECTRE_REFRESH_TOKEN asset not found in Orchestrator")
+    asset_id = items[0]["Id"]
+    body = {
+        "Id": asset_id,
+        "Name": "SPECTRE_REFRESH_TOKEN",
+        "ValueType": "Credential",
+        "CredentialUsername": "spectre",
+        "CredentialPassword": new_refresh_token,
+        "AllowDirectApiAccess": True,
+    }
+    put_resp = requests.put(
+        f"{base_url}/orchestrator_/odata/Assets({asset_id})",
+        headers=headers,
+        json=body,
+        timeout=10,
+    )
+    put_resp.raise_for_status()
+
+
+def _load_credentials(sdk: UiPath) -> None:
+    """Read credential assets from Orchestrator and inject into env vars if not already set."""
+    for env_var, asset_name in [
+        ("GITHUB_TOKEN", "GITHUB_TOKEN"),
+        ("UIPATH_PAT", "SPECTRE_PAT"),
+        ("UIPATH_REFRESH_TOKEN", "SPECTRE_REFRESH_TOKEN"),
+    ]:
+        if os.getenv(env_var):
+            continue
+        try:
+            value = sdk.assets.retrieve_credential(asset_name, folder_path=_CG_FOLDER_PATH)
+            if value:
+                os.environ[env_var] = value
+                log.info(f"Loaded {env_var} from Orchestrator asset {asset_name}")
+        except Exception as e:
+            log.warning(f"Could not load {env_var} from asset {asset_name}: {e}")
+
+
 async def fix(input: FixIn) -> FixOut:
     log.info(f"SpectreCodingAgent — txn={input.transaction_id} process={input.process_name}")
 
     sdk = UiPath()
+    _load_credentials(sdk)
     support_handle = _get_support_handle(sdk)
 
     # ── 1. Find repo ──────────────────────────────────────────────────────────
@@ -98,14 +291,31 @@ async def fix(input: FixIn) -> FixOut:
         log.info(f"Duplicate found — skipping: {existing_url}")
         return FixOut(
             fixed=False, pr_url=existing_url, repo_full_name=repo_full_name,
-            branch_name="", file_changed="", target_activity="",
+            branch_name="", files_changed=[],
             fix_description="Duplicate — existing PR/issue found",
             llm_confidence="", is_duplicate=True,
             message=f"Duplicate found: {existing_url}",
         )
 
     try:
+        pat, base_url = get_pat()
+    except Exception as e:
+        log.error(f"Orchestrator auth failed: {e}")
+        return _empty_out(
+            f"SpectreAI could not authenticate with Orchestrator. "
+            f"Please contact {support_handle} if this persists.",
+        )
+
+    try:
         llm_token, base_url = get_llm_token()
+        new_refresh_token = os.getenv("UIPATH_REFRESH_TOKEN")
+        if new_refresh_token:
+            try:
+                _writeback_refresh_token(pat, base_url, new_refresh_token)
+                log.info("Rotated refresh token written back to Orchestrator asset")
+                _update_env_file(new_refresh_token)
+            except Exception as wb_err:
+                log.warning(f"Could not write rotated refresh token to asset: {wb_err}")
     except Exception as e:
         log.error(f"LLM token acquisition failed: {e}")
         return _empty_out(
@@ -114,7 +324,8 @@ async def fix(input: FixIn) -> FixOut:
         )
 
     # ── 3. Fetch XAML listing ─────────────────────────────────────────────────
-    branch_name = f"spectre-fix/{input.transaction_id.lower()}"
+    safe_txn = re.sub(r"[^a-z0-9-]", "-", input.transaction_id.lower()).strip("-")
+    branch_name = f"spectre-fix/{safe_txn}"
     try:
         ensure_branch(repo_full_name, branch_name)
     except Exception as e:
@@ -124,17 +335,16 @@ async def fix(input: FixIn) -> FixOut:
             f"Please contact {support_handle} for manual investigation.",
         )
 
+    prior_fix = ""
     scan_results = fetch_xaml_listing(repo_full_name)
     repo_summary = build_repo_summary(scan_results)
     log.info(f"Fetched listing of {len(scan_results)} XAML files")
 
     # ── 4. LLM call 1: file selection ─────────────────────────────────────────
     selection = await select_target_files(llm_token, base_url, input.diagnosis, repo_summary)
-    candidates = selection.get("candidates", [])[:3]
+    candidates = selection.get("candidates", [])[:5]
     selection_confidence = selection.get("confidence", "Low")
     log.info(f"File selection: candidates={candidates} confidence={selection_confidence}")
-
-    patch_skip_reason = ""
 
     if not candidates:
         log.warning("LLM could not identify candidate files — opening report-only PR")
@@ -146,12 +356,16 @@ async def fix(input: FixIn) -> FixOut:
         if not candidate_files:
             fix_result = _no_fix_result("Candidate files identified but could not be read", "Low")
         else:
+            # ── 6a. Search KB for prior fix to guide LLM ──────────────────────
+            prior_fix = _search_kb_for_similar(sdk, input.diagnosis)
+
             # ── 6. LLM call 2: analyse and fix ────────────────────────────────
             try:
                 fix_result = await analyse_and_fix(
                     llm_token, base_url,
                     input.diagnosis, input.recommended_action,
                     candidate_files,
+                    prior_fix=prior_fix,
                 )
             except Exception as e:
                 log.error(f"LLM fix analysis failed: {e}")
@@ -159,48 +373,56 @@ async def fix(input: FixIn) -> FixOut:
 
             log.info(f"Fix analysis: can_fix={fix_result.get('can_fix')} confidence={fix_result.get('confidence')}")
 
-            # Normalise confidence casing — LLM may return "high"/"medium"/"low"
             if "confidence" in fix_result:
                 fix_result["confidence"] = fix_result["confidence"].capitalize()
 
-            # Apply patch if possible
-            if fix_result.get("can_fix") and fix_result.get("original_snippet"):
-                target_file = fix_result.get("target_file", "")
-                original = fix_result["original_snippet"]
-                replacement = fix_result.get("replacement_snippet", "")
-                original_content = candidate_files.get(target_file)
-
-                replacement_valid = True
-                try:
-                    ET.fromstring(replacement)
-                except ET.ParseError as xml_err:
-                    replacement_valid = False
-                    patch_skip_reason = f"LLM-generated replacement_snippet is not valid XML: {xml_err}"
-                    log.warning(f"replacement_snippet is not valid XML — patch skipped: {xml_err}")
-                    fix_result["_actually_patched"] = False
-                    fix_result["target_file"] = ""
+            # ── 7. Apply patches ───────────────────────────────────────────────
+            if fix_result.get("can_fix"):
+                fixes = fix_result.get("fixes", [])
+                if not fixes:
+                    log.warning("LLM returned can_fix=true but fixes=[] — treating as report-only")
+                    fix_result["can_fix"] = False
+                    fix_result["_patch_results"] = []
                     try:
                         _commit_report(repo_full_name, branch_name, input, fix_result)
                     except Exception as ce:
                         log.warning(f"Report commit failed (continuing to PR): {ce}")
+                else:
+                    # Deduplicate fixes by target_file — keep last entry per file (LLM may repeat)
+                    seen = {}
+                    for entry in fixes:
+                        seen[entry.get("target_file", "")] = entry
+                    fixes = list(seen.values())
 
-                if replacement_valid:
-                    if original_content and original in original_content:
-                        patched = original_content.replace(original, replacement, 1)
-                        commit_msg = fix_result.get("commit_message") or f"[SpectreAI] Fix for {input.transaction_id}"
-                        commit_file_to_branch(repo_full_name, branch_name, target_file, patched, commit_msg)
-                        fix_result["_actually_patched"] = True
-                        log.info(f"Patch committed to {target_file} on {branch_name}")
-                    else:
-                        patch_skip_reason = f"original_snippet not found verbatim in `{target_file}` — possible whitespace drift or truncation"
-                        fix_result["_actually_patched"] = False
-                        fix_result["target_file"] = ""
-                        log.warning("original_snippet not found verbatim — patch skipped")
+                    patch_results = []
+                    for entry in fixes:
+                        target_file = entry.get("target_file", "")
+                        patched, skip_reason = _apply_fix_entry(
+                            entry, candidate_files, repo_full_name, branch_name
+                        )
+                        patch_results.append({
+                            "target_file": target_file,
+                            "target_activity": entry.get("target_activity", ""),
+                            "patch_mode": entry.get("patch_mode", ""),
+                            "patched": patched,
+                            "skip_reason": skip_reason,
+                            "start_line": entry.get("start_line", ""),
+                            "end_line": entry.get("end_line", ""),
+                            "replacement_lines": entry.get("replacement_lines", ""),
+                            "hunks": entry.get("hunks", []),
+                            "rewritten_xaml": entry.get("rewritten_xaml", ""),
+                            "commit_message": entry.get("commit_message", ""),
+                        })
+
+                    fix_result["_patch_results"] = patch_results
+                    any_patched = any(r["patched"] for r in patch_results)
+                    if not any_patched:
                         try:
                             _commit_report(repo_full_name, branch_name, input, fix_result)
                         except Exception as ce:
                             log.warning(f"Report commit failed (continuing to PR): {ce}")
             else:
+                fix_result["_patch_results"] = []
                 try:
                     _commit_report(repo_full_name, branch_name, input, fix_result)
                 except Exception as ce:
@@ -208,18 +430,37 @@ async def fix(input: FixIn) -> FixOut:
 
     # ── Build labels ──────────────────────────────────────────────────────────
     llm_confidence = fix_result.get("confidence", "Low")
-    issue_type_label = fix_result.get("issue_type_label", "unknown")
-    labels = ["bug", "spectre-ai", issue_type_label]
+    failure_category = fix_result.get("failure_category", "unknown")
+    patch_results = fix_result.get("_patch_results", [])
+    any_patched = any(r["patched"] for r in patch_results)
+    labels = ["bug", "spectre-ai", failure_category]
     if llm_confidence == "Low" or not fix_result.get("can_fix"):
         labels.append("needs-human-review")
 
-    # ── Assignee from CODEOWNERS ──────────────────────────────────────────────
-    assignee = get_codeowner(repo_full_name)
+    files_changed = [r["target_file"] for r in patch_results if r["patched"]]
+
+    # ── Assignee: last committer on primary file, fallback to CODEOWNERS ─────
+    primary_file = files_changed[0] if files_changed else (candidates[0] if candidates else None)
+    assignee = None
+    if primary_file:
+        assignee = get_last_committer(repo_full_name, primary_file)
+        if assignee:
+            log.info(f"Assignee from last committer on {primary_file}: {assignee}")
+    if not assignee:
+        assignee = get_codeowner(repo_full_name)
+        if assignee:
+            log.info(f"Assignee from CODEOWNERS: {assignee}")
+
+    # ── #7: KB note for PR body — reuse prior_fix if set, else search by issue_type_label ──
+    similar_fix_note = prior_fix
+    if not similar_fix_note:
+        issue_type_label = fix_result.get("issue_type_label", "")
+        if issue_type_label and issue_type_label not in ("Unknown", ""):
+            similar_fix_note = _search_kb_for_similar(sdk, issue_type_label)
 
     # ── Open draft PR ─────────────────────────────────────────────────────────
-    actually_patched = fix_result.get("_actually_patched", False)
-    pr_title = _build_pr_title(input, fix_result, actually_patched)
-    pr_body = _build_pr_body(input, fix_result, actually_patched, selection_confidence, branch_name, patch_skip_reason)
+    pr_title = _build_pr_title(input, fix_result, any_patched)
+    pr_body = _build_pr_body(input, fix_result, any_patched, selection_confidence, branch_name, similar_fix_note)
     try:
         pr_url = create_draft_pr(repo_full_name, branch_name, pr_title, pr_body, labels, assignee)
     except Exception as e:
@@ -228,41 +469,43 @@ async def fix(input: FixIn) -> FixOut:
             f"SpectreAI analysed the issue but could not submit the fix for review. "
             f"Please contact {support_handle} for manual investigation.",
         )
-
     log.info(f"Draft PR opened: {pr_url}")
+
+    # ── #8: Write fix outcome to SpectreKB so future runs learn from this ────
+    _ingest_fix_to_kb(sdk, input, fix_result, pr_url, any_patched)
+
     return FixOut(
-        fixed=actually_patched,
+        fixed=any_patched,
         pr_url=pr_url,
         repo_full_name=repo_full_name,
         branch_name=branch_name,
-        file_changed=fix_result.get("target_file", ""),
-        target_activity=fix_result.get("target_activity", ""),
+        files_changed=files_changed,
         fix_description=fix_result.get("explanation", ""),
         llm_confidence=llm_confidence,
         is_duplicate=False,
-        message=f"Draft PR opened: {pr_url}" + (" (code patched)" if actually_patched else " (report only)"),
+        message=f"Draft PR opened: {pr_url}" + (" (code patched)" if any_patched else " (report only)"),
     )
 
 
 def _no_fix_result(reason: str, confidence: str) -> dict:
     return {
         "can_fix": False,
-        "target_file": "",
-        "target_activity": "",
-        "original_snippet": "",
-        "replacement_snippet": "",
+        "patch_mode": "none",
+        "fixes": [],
         "explanation": reason,
         "commit_message": "",
         "confidence": confidence,
-        "issue_type_label": "unknown",
-        "_actually_patched": False,
+        "issue_type_label": "Unknown",
+        "failure_category": "unknown",
+        "caveats": [],
+        "_patch_results": [],
     }
 
 
 def _empty_out(message: str) -> FixOut:
     return FixOut(
         fixed=False, pr_url="", repo_full_name="", branch_name="",
-        file_changed="", target_activity="", fix_description=message,
+        files_changed=[], fix_description=message,
         llm_confidence="", is_duplicate=False, message=message,
     )
 
@@ -278,29 +521,61 @@ def _build_pr_body(
     patched: bool,
     selection_confidence: str = "Low",
     branch_name: str = "",
-    patch_skip_reason: str = "",
+    similar_fix_note: str = "",
 ) -> str:
     status = "Code change applied" if patched else "Report only — manual fix required"
-    diff_section = ""
+    patch_results = fix_result.get("_patch_results", [])
 
-    if patched and fix_result.get("original_snippet"):
-        diff_section = (
-            f"\n### XAML Change\n"
-            f"**File:** `{fix_result['target_file']}`  \n"
-            f"**Activity:** `{fix_result.get('target_activity', 'unknown')}`\n\n"
-            f"**Before:**\n```xml\n{fix_result['original_snippet']}\n```\n\n"
-            f"**After:**\n```xml\n{fix_result['replacement_snippet']}\n```\n"
-        )
-    elif not patched and fix_result.get("original_snippet"):
-        skip_note = f"\n> **Patch not applied:** {patch_skip_reason}\n" if patch_skip_reason else ""
-        diff_section = (
-            f"\n### Proposed Change (apply manually)\n"
-            f"{skip_note}"
-            f"**File:** `{fix_result.get('target_file') or 'see diagnosis'}`  \n"
-            f"**Activity:** `{fix_result.get('target_activity', 'unknown')}`\n\n"
-            f"**Replace:**\n```xml\n{fix_result['original_snippet']}\n```\n\n"
-            f"**With:**\n```xml\n{fix_result['replacement_snippet']}\n```\n"
-        )
+    # Build per-file diff sections
+    diff_section = ""
+    if patch_results:
+        diff_section = "\n### Changes\n"
+        for r in patch_results:
+            file_label = f"`{r['target_file']}`" if r["target_file"] else "see diagnosis"
+            activity_label = f"`{r['target_activity']}`" if r["target_activity"] else "unknown"
+
+            if r["patched"] and r["patch_mode"] == "snippet":
+                diff_section += (
+                    f"\n#### {file_label} — {activity_label}\n"
+                    f"**Before:**\n```xml\n{r['original_snippet']}\n```\n\n"
+                    f"**After:**\n```xml\n{r['replacement_snippet']}\n```\n"
+                )
+            elif r["patched"] and r["patch_mode"] == "full_rewrite":
+                diff_section += (
+                    f"\n#### {file_label} — {activity_label}\n"
+                    f"> Full file rewrite committed — review the diff in this PR for exact changes.\n"
+                )
+            elif not r["patched"] and r["patch_mode"] == "snippet" and r.get("original_snippet"):
+                diff_section += (
+                    f"\n#### {file_label} — {activity_label} ⚠️ not applied\n"
+                    f"> **Patch not applied:** {r['skip_reason']}\n\n"
+                    f"**Proposed replacement:**\n```xml\n{r['replacement_snippet']}\n```\n"
+                )
+            elif not r["patched"] and r["patch_mode"] == "full_rewrite" and r.get("rewritten_xaml"):
+                truncated = r["rewritten_xaml"][:3000]
+                suffix = "...[truncated]" if len(r["rewritten_xaml"]) > 3000 else ""
+                diff_section += (
+                    f"\n#### {file_label} — {activity_label} ⚠️ not applied\n"
+                    f"> **Rewrite not committed:** {r['skip_reason']}\n\n"
+                    f"**Proposed rewrite:**\n```xml\n{truncated}{suffix}\n```\n"
+                )
+            else:
+                diff_section += (
+                    f"\n#### {file_label} — {activity_label} ⚠️ not applied\n"
+                    f"> {r['skip_reason']}\n"
+                )
+
+    caveats = fix_result.get("caveats") or []
+    caveats_section = ""
+    if caveats:
+        items = "\n".join(f"- {c}" for c in caveats)
+        caveats_section = f"\n### Developer Checks Required\n> ⚠️ SpectreAI could not verify these automatically — please review before merging:\n\n{items}\n"
+
+    similar_section = ""
+    if similar_fix_note:
+        truncated = similar_fix_note[:800]
+        suffix = "…" if len(similar_fix_note) > 800 else ""
+        similar_section = f"\n### Similar Past Fix (from SpectreKB)\n> SpectreAI found a related fix in the knowledge base — review before merging:\n\n{truncated}{suffix}\n"
 
     return (
         f"## SpectreAI Coding Agent — {status}\n\n"
@@ -308,12 +583,15 @@ def _build_pr_body(
         f"| Field | Value |\n|---|---|\n"
         f"| Transaction ID | `{input.transaction_id}` |\n"
         f"| Process | {input.process_name} |\n"
+        f"| Issue | {fix_result.get('issue_type_label', 'Unknown')} |\n"
         f"| Investigation confidence | {input.confidence} |\n"
         f"| LLM fix confidence | {fix_result.get('confidence', 'Low')} |\n\n"
         f"### Diagnosis\n{input.diagnosis}\n\n"
         f"### Recommended Action\n{input.recommended_action}\n\n"
         f"### Fix Analysis\n{fix_result.get('explanation', '')}"
-        f"{diff_section}\n"
+        f"{diff_section}"
+        f"{caveats_section}"
+        f"{similar_section}\n"
         f"---\n*Raised automatically by SpectreCodingAgent — review before merging*"
     )
 

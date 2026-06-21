@@ -1,7 +1,13 @@
 """Tests for github_client."""
+import os
 import pytest
 from unittest.mock import MagicMock, patch, call
 from github import GithubException
+
+# All tests that call _get_client() need GITHUB_TOKEN set, otherwise it raises
+# before Github() is ever constructed. Set it for the whole test session.
+if not os.environ.get("GITHUB_TOKEN"):
+    os.environ["GITHUB_TOKEN"] = "test-token"
 
 
 def _make_repo(full_name, topics=None):
@@ -32,10 +38,11 @@ class TestFindRepoByProcess:
     @patch("spectre_coding.github_client.Github")
     def test_finds_repo_via_search_api(self, MockGithub):
         repo = _make_repo("Org/InvoiceBot")
-        MockGithub.return_value.search_repositories.return_value = [repo]
+        instance = MockGithub.return_value
+        instance.search_repositories.return_value = [repo]
         from spectre_coding.github_client import find_repo_by_process
         assert find_repo_by_process("3201 Invoice Processing") == "Org/InvoiceBot"
-        query = MockGithub.return_value.search_repositories.call_args[0][0]
+        query = instance.search_repositories.call_args[0][0]
         assert "topic:3201" in query
 
     @patch("spectre_coding.github_client.Github")
@@ -51,30 +58,34 @@ class TestFindRepoByProcess:
     @patch("spectre_coding.github_client.Github")
     def test_finds_repo_with_three_digit_process_number(self, MockGithub):
         repo = _make_repo("Org/ShortBot")
-        MockGithub.return_value.search_repositories.return_value = [repo]
+        instance = MockGithub.return_value
+        instance.search_repositories.return_value = [repo]
         from spectre_coding.github_client import find_repo_by_process
         assert find_repo_by_process("321 Short Process") == "Org/ShortBot"
-        query = MockGithub.return_value.search_repositories.call_args[0][0]
+        query = instance.search_repositories.call_args[0][0]
         assert "topic:321" in query
 
     @patch("spectre_coding.github_client.Github")
     def test_finds_repo_with_five_digit_process_number(self, MockGithub):
         repo = _make_repo("Org/LongBot")
-        MockGithub.return_value.search_repositories.return_value = [repo]
+        instance = MockGithub.return_value
+        instance.search_repositories.return_value = [repo]
         from spectre_coding.github_client import find_repo_by_process
         assert find_repo_by_process("32101 Long Process") == "Org/LongBot"
-        query = MockGithub.return_value.search_repositories.call_args[0][0]
+        query = instance.search_repositories.call_args[0][0]
         assert "topic:32101" in query
 
     def test_returns_none_when_github_token_missing(self):
-        import spectre_coding.github_client as gc
-        original = gc._GITHUB_TOKEN
+        # Temporarily remove GITHUB_TOKEN so _get_client() raises, causing find_repo to return None
+        saved = os.environ.pop("GITHUB_TOKEN", None)
         try:
-            gc._GITHUB_TOKEN = ""
             from spectre_coding.github_client import find_repo_by_process
             assert find_repo_by_process("3201 Invoice Processing") is None
         finally:
-            gc._GITHUB_TOKEN = original
+            if saved is not None:
+                os.environ["GITHUB_TOKEN"] = saved
+            else:
+                os.environ["GITHUB_TOKEN"] = "test-token"
 
 
 # ── check_duplicate ───────────────────────────────────────────────────────────
@@ -154,6 +165,49 @@ class TestGetCodeowner:
         MockGithub.return_value.get_repo.return_value = repo
         from spectre_coding.github_client import get_codeowner
         assert get_codeowner("Org/Repo") == "real-owner"
+
+
+# ── get_last_committer ────────────────────────────────────────────────────────
+
+class TestGetLastCommitter:
+    @patch("spectre_coding.github_client.Github")
+    def test_returns_login_of_last_committer(self, MockGithub):
+        author = MagicMock()
+        author.login = "nithin-br"
+        commit = MagicMock()
+        commit.author = author
+        repo = MagicMock()
+        repo.get_commits.return_value = [commit]
+        MockGithub.return_value.get_repo.return_value = repo
+        from spectre_coding.github_client import get_last_committer
+        assert get_last_committer("Org/Repo", "Framework/Process.xaml") == "nithin-br"
+        repo.get_commits.assert_called_once_with(path="Framework/Process.xaml")
+
+    @patch("spectre_coding.github_client.Github")
+    def test_returns_none_when_no_commits(self, MockGithub):
+        repo = MagicMock()
+        repo.get_commits.return_value = []
+        MockGithub.return_value.get_repo.return_value = repo
+        from spectre_coding.github_client import get_last_committer
+        assert get_last_committer("Org/Repo", "Framework/Process.xaml") is None
+
+    @patch("spectre_coding.github_client.Github")
+    def test_returns_none_on_github_exception(self, MockGithub):
+        repo = MagicMock()
+        repo.get_commits.side_effect = Exception("API error")
+        MockGithub.return_value.get_repo.return_value = repo
+        from spectre_coding.github_client import get_last_committer
+        assert get_last_committer("Org/Repo", "Framework/Process.xaml") is None
+
+    @patch("spectre_coding.github_client.Github")
+    def test_returns_none_when_commit_has_no_author(self, MockGithub):
+        commit = MagicMock()
+        commit.author = None
+        repo = MagicMock()
+        repo.get_commits.return_value = [commit]
+        MockGithub.return_value.get_repo.return_value = repo
+        from spectre_coding.github_client import get_last_committer
+        assert get_last_committer("Org/Repo", "Framework/Process.xaml") is None
 
 
 # ── create_draft_pr ───────────────────────────────────────────────────────────

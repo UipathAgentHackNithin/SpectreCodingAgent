@@ -16,7 +16,6 @@ except ImportError:
 
 log = get_logger("spectre.github")
 
-_GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
 _GITHUB_ORG = os.getenv("GITHUB_ORG", "UipathAgentHackNithin")
 
 _RETRY_STATUSES = {500, 502, 503, 504}
@@ -25,9 +24,10 @@ _DUPLICATE_CHECK_LIMIT = 50
 
 
 def _get_client() -> Github:
-    if not _GITHUB_TOKEN:
+    token = os.getenv("GITHUB_TOKEN", "")
+    if not token:
         raise ValueError("GITHUB_TOKEN environment variable is not set")
-    return Github(auth=Auth.Token(_GITHUB_TOKEN))
+    return Github(auth=Auth.Token(token))
 
 
 def _retry(fn, *args, **kwargs):
@@ -48,7 +48,13 @@ def _retry(fn, *args, **kwargs):
 
 
 def find_repo_by_process(process_name: str) -> Optional[str]:
-    """Find GitHub repo by searching for a topic matching the process number."""
+    """Find GitHub repo whose topics contain the process number.
+
+    Tries two strategies:
+    1. Exact GitHub topic search (fast — works when topic == process_number exactly)
+    2. Org scan — checks each repo's topics for any entry containing process_number
+       as a substring (handles topics like '3201-invoice-processing')
+    """
     match = re.search(r"\b(\d{3,})\b", process_name)
     if not match:
         log.warning(f"No numeric process ID found in: {process_name}")
@@ -61,11 +67,27 @@ def find_repo_by_process(process_name: str) -> Optional[str]:
         log.error(f"GitHub client init failed: {e}")
         return None
 
-    results = g.search_repositories(f"org:{_GITHUB_ORG} topic:{process_number}")
-    for repo in results:
-        log.info(f"Found repo {repo.full_name} via topic search for {process_number}")
-        return repo.full_name
-    log.warning(f"No repo found for process number {process_number}")
+    # 1. Fast path: exact topic match
+    try:
+        for repo in g.search_repositories(f"org:{_GITHUB_ORG} topic:{process_number}"):
+            log.info(f"Found repo {repo.full_name} via exact topic:{process_number}")
+            return repo.full_name
+    except Exception as exc:
+        log.warning(f"Exact topic search failed: {exc}")
+
+    # 2. Org scan: any topic containing the process number as a substring
+    try:
+        for repo in g.get_organization(_GITHUB_ORG).get_repos():
+            try:
+                if any(process_number in t for t in repo.get_topics()):
+                    log.info(f"Found repo {repo.full_name} via org scan (topic contains '{process_number}')")
+                    return repo.full_name
+            except Exception:
+                continue
+    except Exception as exc:
+        log.warning(f"Org repo scan failed: {exc}")
+
+    log.warning(f"No repo found for process number {process_number} in org {_GITHUB_ORG}")
     return None
 
 
@@ -108,6 +130,20 @@ def get_codeowner(repo_full_name: str) -> Optional[str]:
                     return match.group(1)
         except GithubException:
             continue
+    return None
+
+
+def get_last_committer(repo_full_name: str, file_path: str) -> Optional[str]:
+    """Return the GitHub login of the last person to commit to file_path, or None."""
+    g = _get_client()
+    try:
+        repo = g.get_repo(repo_full_name)
+        commits = repo.get_commits(path=file_path)
+        commit = commits[0]
+        if commit.author:
+            return commit.author.login
+    except Exception:
+        pass
     return None
 
 
@@ -178,8 +214,17 @@ def commit_file_to_branch(
         )
         log.info(f"Updated {file_path} on {branch_name}")
     except GithubException as exc:
-        log.warning(f"commit_file_to_branch failed for {file_path}: {exc}")
-        raise
+        if exc.status == 404:
+            repo.create_file(
+                path=file_path,
+                message=commit_message,
+                content=new_content,
+                branch=branch_name,
+            )
+            log.info(f"Created {file_path} on {branch_name}")
+        else:
+            log.warning(f"commit_file_to_branch failed for {file_path}: {exc}")
+            raise
 
 
 def _commit_report(repo_full_name: str, branch_name: str, input, fix_result: dict) -> None:

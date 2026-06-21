@@ -1,7 +1,7 @@
 {
-  "transaction_id": "INV-98766",
-  "process_name": "3201 Invoice Processing",
-  "diagnosis": "SAP login failed due to credential timeout on the authentication step",
-  "recommended_action": "Rotate SAP credentials and implement retry logic with exponential backoff",
+  "transaction_id": "INV-98774",
+  "process_name": "ICSAUTO-3201",
+  "diagnosis": "The logs explicitly show a clear system error during the processing of invoice INV-98774 by the InvoiceProcessing_Performer bot. The error message is 'Get TaxAmount (crashes — key missing): The given key was not present in the dictionary.' This error occurs in CalculateInvoiceTotals.xaml at Assign 'Get TaxAmount (crashes — key missing)' — the SpecificContent dictionary of the queue item does not contain the key TaxAmount, causing a KeyNotFoundException when accessed directly.",
+  "recommended_action": "Investigate why the dictionary key for TaxAmount is missing during the CalculateInvoiceTotals workflow. Verify the input data for invoice INV-98774 to ensure all required fields, especially TaxAmount, are present and correctly formatted. Update the bot to handle the missing key gracefully by adding a null/key guard before accessing TaxAmount from SpecificContent.",
   "confidence": "High"
 }

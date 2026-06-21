@@ -125,21 +125,23 @@ def build_repo_summary(scan_results: list[dict]) -> str:
     lines = [f"Repository contains {len(scan_results)} XAML file(s):\n"]
     for f in scan_results:
         lines.append(f"--- FILE: {f['path']} ---")
-        if f["display_names"]:
+        if f.get("size"):
+            lines.append(f"  Size: {f['size']} bytes")
+        if f.get("display_names"):
             lines.append(f"  Activities: {', '.join(f['display_names'][:15])}")
-        if f["activity_types"]:
+        if f.get("activity_types"):
             unique_types = [t for t in f["activity_types"] if t not in ("If", "Sequence", "Flowchart", "FlowDecision")]
             if unique_types:
                 lines.append(f"  Activity types: {', '.join(unique_types[:10])}")
-        if f["catch_exception_types"]:
+        if f.get("catch_exception_types"):
             lines.append(f"  Catches: {', '.join(f['catch_exception_types'])}")
-        if f["log_messages"]:
+        if f.get("log_messages"):
             lines.append(f"  Error/Warn logs: {' | '.join(f['log_messages'][:3])}")
-        if f["throw_messages"]:
+        if f.get("throw_messages"):
             lines.append(f"  Throws: {' | '.join(f['throw_messages'][:2])}")
-        if f["selectors"]:
+        if f.get("selectors"):
             lines.append(f"  Selectors: {' | '.join(f['selectors'][:2])}")
-        if f["endpoints"]:
+        if f.get("endpoints"):
             lines.append(f"  Endpoints: {', '.join(f['endpoints'][:3])}")
         lines.append("")
     return "\n".join(lines)
