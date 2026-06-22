@@ -139,21 +139,20 @@ def _apply_fix_entry(entry: dict, candidate_files: dict, repo_full_name: str, br
     target_file = entry.get("target_file", "")
     commit_msg = entry.get("commit_message") or "[SpectreAI] Fix"
 
-    if patch_mode in ("line_range", "multi_range"):
+    if patch_mode == "multi_range":
         original_content = candidate_files.get(target_file)
         if not original_content:
             return False, f"content of {target_file} not available"
 
         ns_decls = " ".join(re.findall(r'xmlns(?::\w+)?="[^"]*"', original_content))
-
-        # Normalise to a list of hunks regardless of mode
-        if patch_mode == "line_range":
-            hunks = [{"start_line": entry.get("start_line"), "end_line": entry.get("end_line"),
-                      "replacement_lines": entry.get("replacement_lines", "")}]
-        else:
-            hunks = entry.get("hunks", [])
-            if not hunks:
-                return False, "multi_range fix has empty hunks list"
+        hunks = entry.get("hunks") or []
+        # LLM sometimes puts the fix in top-level start_line/end_line/replacement_lines
+        # instead of hunks — auto-promote to a single hunk so the patch still applies
+        if not hunks and entry.get("start_line") and entry.get("end_line") and entry.get("replacement_lines"):
+            hunks = [{"start_line": entry["start_line"], "end_line": entry["end_line"], "replacement_lines": entry["replacement_lines"]}]
+            log.info(f"Promoted top-level line range to single hunk for {target_file}")
+        if not hunks:
+            return False, "multi_range fix has empty hunks list"
 
         # Validate all hunks before touching the file
         for i, hunk in enumerate(hunks):
@@ -180,8 +179,7 @@ def _apply_fix_entry(entry: dict, candidate_files: dict, repo_full_name: str, br
 
         patched_content = "".join(lines)
         commit_file_to_branch(repo_full_name, branch_name, target_file, patched_content, commit_msg)
-        hunk_summary = f"{len(hunks)} hunk(s)" if patch_mode == "multi_range" else f"lines {entry.get('start_line')}–{entry.get('end_line')}"
-        log.info(f"{patch_mode} patch committed to {target_file} ({hunk_summary})")
+        log.info(f"multi_range patch committed to {target_file} ({len(hunks)} hunk(s))")
         return True, ""
 
     elif patch_mode == "full_rewrite" and entry.get("rewritten_xaml"):
@@ -197,7 +195,7 @@ def _apply_fix_entry(entry: dict, candidate_files: dict, repo_full_name: str, br
         log.info(f"Full XAML rewrite committed to {target_file} on {branch_name}")
         return True, ""
 
-    return False, "no patchable content in fix entry"
+    return False, f"unsupported or incomplete patch_mode '{patch_mode}'"
 
 
 def _update_env_file(new_refresh_token: str) -> None:
@@ -400,6 +398,8 @@ async def fix(input: FixIn) -> FixOut:
                         patched, skip_reason = _apply_fix_entry(
                             entry, candidate_files, repo_full_name, branch_name
                         )
+                        if not patched:
+                            log.warning(f"Patch skipped for {target_file}: {skip_reason}")
                         patch_results.append({
                             "target_file": target_file,
                             "target_activity": entry.get("target_activity", ""),
@@ -534,22 +534,10 @@ def _build_pr_body(
             file_label = f"`{r['target_file']}`" if r["target_file"] else "see diagnosis"
             activity_label = f"`{r['target_activity']}`" if r["target_activity"] else "unknown"
 
-            if r["patched"] and r["patch_mode"] == "snippet":
-                diff_section += (
-                    f"\n#### {file_label} — {activity_label}\n"
-                    f"**Before:**\n```xml\n{r['original_snippet']}\n```\n\n"
-                    f"**After:**\n```xml\n{r['replacement_snippet']}\n```\n"
-                )
-            elif r["patched"] and r["patch_mode"] == "full_rewrite":
+            if r["patched"] and r["patch_mode"] == "full_rewrite":
                 diff_section += (
                     f"\n#### {file_label} — {activity_label}\n"
                     f"> Full file rewrite committed — review the diff in this PR for exact changes.\n"
-                )
-            elif not r["patched"] and r["patch_mode"] == "snippet" and r.get("original_snippet"):
-                diff_section += (
-                    f"\n#### {file_label} — {activity_label} ⚠️ not applied\n"
-                    f"> **Patch not applied:** {r['skip_reason']}\n\n"
-                    f"**Proposed replacement:**\n```xml\n{r['replacement_snippet']}\n```\n"
                 )
             elif not r["patched"] and r["patch_mode"] == "full_rewrite" and r.get("rewritten_xaml"):
                 truncated = r["rewritten_xaml"][:3000]

@@ -134,39 +134,26 @@ Your job: analyse the XAML workflow file(s) and produce the minimal fix — or e
 1. Identify ALL files and activities involved in the failure — a fix may span multiple files.
 2. If a concrete XML change can fix it (set can_fix = true), produce one entry per file in the fixes array.
 
-   STEP A — count how many separate locations in the file need changing:
-     - 1 contiguous block                          → patch_mode = "line_range"
-     - 2 or more separate non-overlapping blocks   → patch_mode = "multi_range"  ← USE THIS, do not collapse to one range
+   STEP A — choose patch_mode:
+     - any targeted line change (1 or more blocks) → patch_mode = "multi_range"
      - structural change (add/remove/move activity) → patch_mode = "full_rewrite"
    This decision must be made FIRST before writing any replacement content.
 
    For each fix entry choose the patch_mode determined above:
 
-   patch_mode = "line_range"  — use when the fix is a single contiguous block change:
+   patch_mode = "multi_range"  — use for ALL targeted fixes (single or multiple blocks):
      - Selector string / attribute value update
-     - Single property change (e.g. Timeout, RetryCount, URL endpoint)
-     - A small expression fix inside one activity
-     Rules:
-       - start_line: 1-based line number of the FIRST line to replace (integer)
-       - end_line: 1-based line number of the LAST line to replace (integer, inclusive)
-       - replacement_lines: the COMPLETE corrected XML replacing lines start_line..end_line.
-                            IMPORTANT: include EVERY line in that range, fully rewritten.
-                            Do NOT omit unchanged lines — the entire range is replaced verbatim.
-                            Must be a valid XML fragment on its own.
-       - hunks: [] (empty)
-       - rewritten_xaml: "" (empty)
-       - The file is shown above with line numbers as "N: ". Use those numbers directly.
-         Widen the range to cover the full XML element (include opening and closing tags).
-         Never split an element across the boundary.
-       {SNIPPET_RULES}
-
-   patch_mode = "multi_range"  — use when the fix touches multiple separate locations in the same file:
+     - Single or multiple property changes
      - Two or more independent activities each needing a different fix
-     - Fixing both a NullReference guard AND a downstream expression bug in the same file
      Rules:
        - hunks: array of objects, one per changed block, each with:
            start_line (int), end_line (int), replacement_lines (string)
-           Same rules as line_range apply to each hunk individually.
+           - start_line/end_line: 1-based line numbers (inclusive). Use the "N: " line numbers shown above.
+             Widen the range to cover the full XML element (include opening and closing tags).
+             Never split an element across the boundary.
+           - replacement_lines: the COMPLETE corrected XML replacing that range.
+             Include EVERY line in the range, fully rewritten. Do NOT omit unchanged lines.
+             Must be a valid XML fragment on its own.
        - Hunks MUST NOT overlap. Order them however you like — they are applied bottom-to-top automatically.
        - start_line/end_line/replacement_lines at the top level: set to null/"" (use hunks instead)
        - rewritten_xaml: "" (empty)
@@ -276,7 +263,7 @@ Respond ONLY in valid JSON:
     {{
       "target_file": "relative/path.xaml",
       "target_activity": "DisplayName of the activity",
-      "patch_mode": "line_range|multi_range|full_rewrite",
+      "patch_mode": "multi_range|full_rewrite",
       "start_line": null,
       "end_line": null,
       "replacement_lines": "",

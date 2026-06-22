@@ -45,14 +45,13 @@ def _selection(candidates, confidence="High"):
     return {"candidates": candidates, "reason": "test", "confidence": confidence}
 
 
-def _fix_entry(patch_mode="snippet", target_file="Framework/Process.xaml",
+def _fix_entry(patch_mode="multi_range", target_file="Framework/Process.xaml",
                target_activity="Click Login Button"):
     entry = {
         "target_file": target_file,
         "target_activity": target_activity,
         "patch_mode": patch_mode,
-        "original_snippet": "<old/>" if patch_mode == "snippet" else "",
-        "replacement_snippet": "<new/>" if patch_mode == "snippet" else "",
+        "hunks": [{"start_line": 1, "end_line": 1, "replacement_lines": "<new/>"}] if patch_mode == "multi_range" else [],
         "rewritten_xaml": (
             "<root><NewActivity DisplayName='Click Login Button'/></root>"
             if patch_mode == "full_rewrite" else ""
@@ -63,7 +62,7 @@ def _fix_entry(patch_mode="snippet", target_file="Framework/Process.xaml",
 
 
 def _fix_result(can_fix=True, patched=True, confidence="High", issue_type="SAP GUI - Broken Selector",
-                failure_category="selector", patch_mode="snippet", caveats=None):
+                failure_category="selector", patch_mode="multi_range", caveats=None):
     fixes = [_fix_entry(patch_mode=patch_mode)] if can_fix else []
     return {
         "can_fix": can_fix,
@@ -216,7 +215,7 @@ class TestAgentFlow:
 
 class TestPatchApply:
     @pytest.mark.asyncio
-    async def test_snippet_patch_applied_when_found_verbatim(self):
+    async def test_multi_range_patch_applied_when_found(self):
         committed = {}
 
         def capture_commit(repo, branch, path, content, msg):
@@ -234,7 +233,7 @@ class TestPatchApply:
             patch(_P_SUMMARY, return_value="summary"),
             patch(_P_SELECT, AsyncMock(return_value=_selection(["Framework/Process.xaml"]))),
             patch(_P_FETCH_CONTENTS, return_value={"Framework/Process.xaml": "<old/>"}),
-            patch(_P_ANALYSE, AsyncMock(return_value=_fix_result(patch_mode="snippet"))),
+            patch(_P_ANALYSE, AsyncMock(return_value=_fix_result(patch_mode="multi_range"))),
             patch(_P_COMMIT, side_effect=capture_commit),
             patch(_P_LAST_COMMITTER, return_value=None),
             patch(_P_OWNER, return_value=None),
@@ -279,9 +278,9 @@ class TestPatchApply:
         assert "NewActivity" in committed["content"]
 
     @pytest.mark.asyncio
-    async def test_snippet_skipped_when_replacement_is_invalid_xml(self):
-        bad_fix = _fix_result(patch_mode="snippet")
-        bad_fix["fixes"][0]["replacement_snippet"] = "<unclosed"
+    async def test_multi_range_skipped_when_hunk_is_invalid_xml(self):
+        bad_fix = _fix_result(patch_mode="multi_range")
+        bad_fix["fixes"][0]["hunks"][0]["replacement_lines"] = "<unclosed"
         committed = []
         with (
             patch(_P_SDK, return_value=_mock_sdk()),
@@ -308,9 +307,10 @@ class TestPatchApply:
         assert len(committed) == 0
 
     @pytest.mark.asyncio
-    async def test_snippet_skipped_when_not_found_verbatim(self):
-        no_match_fix = _fix_result(patch_mode="snippet")
-        no_match_fix["fixes"][0]["original_snippet"] = "<does_not_exist/>"
+    async def test_multi_range_skipped_when_line_range_out_of_bounds(self):
+        bad_fix = _fix_result(patch_mode="multi_range")
+        bad_fix["fixes"][0]["hunks"][0]["start_line"] = 999
+        bad_fix["fixes"][0]["hunks"][0]["end_line"] = 1000
         committed = []
         with (
             patch(_P_SDK, return_value=_mock_sdk()),
@@ -324,7 +324,7 @@ class TestPatchApply:
             patch(_P_SUMMARY, return_value="summary"),
             patch(_P_SELECT, AsyncMock(return_value=_selection(["Framework/Process.xaml"]))),
             patch(_P_FETCH_CONTENTS, return_value={"Framework/Process.xaml": "<old/>"}),
-            patch(_P_ANALYSE, AsyncMock(return_value=no_match_fix)),
+            patch(_P_ANALYSE, AsyncMock(return_value=bad_fix)),
             patch(_P_COMMIT, side_effect=lambda *a, **k: committed.append(a)),
             patch(_P_REPORT),
             patch(_P_LAST_COMMITTER, return_value=None),
@@ -375,8 +375,8 @@ class TestPatchApply:
         multi_fix = {
             "can_fix": True,
             "fixes": [
-                _fix_entry(patch_mode="snippet", target_file="Framework/Process.xaml"),
-                _fix_entry(patch_mode="snippet", target_file="Framework/LoginToSAP.xaml"),
+                _fix_entry(patch_mode="multi_range", target_file="Framework/Process.xaml"),
+                _fix_entry(patch_mode="multi_range", target_file="Framework/LoginToSAP.xaml"),
             ],
             "explanation": "Two files needed fixing",
             "confidence": "High",
@@ -414,7 +414,7 @@ class TestPatchApply:
         assert len(result.files_changed) == 2
 
 
-def _patch_result(patch_mode="snippet", patched=True, skip_reason="",
+def _patch_result(patch_mode="multi_range", patched=True, skip_reason="",
                   target_file="Framework/Process.xaml", target_activity="Click Login Button"):
     return {
         "target_file": target_file,
@@ -422,8 +422,7 @@ def _patch_result(patch_mode="snippet", patched=True, skip_reason="",
         "patch_mode": patch_mode,
         "patched": patched,
         "skip_reason": skip_reason,
-        "original_snippet": "<old/>" if patch_mode == "snippet" else "",
-        "replacement_snippet": "<new/>" if (patch_mode == "snippet" and patched) else "",
+        "hunks": [{"start_line": 1, "end_line": 1, "replacement_lines": "<new/>"}] if patch_mode == "multi_range" else [],
         "rewritten_xaml": (
             "<root><NewActivity DisplayName='Click Login Button'/></root>"
             if patch_mode == "full_rewrite" else ""
@@ -445,12 +444,10 @@ class TestPrBodyBuilders:
             "caveats": caveats if caveats is not None else [],
         }
 
-    def test_body_confirms_snippet_applied(self):
+    def test_body_confirms_multi_range_applied(self):
         from spectre_coding.agent import _build_pr_body
-        fr = self._fr([_patch_result(patch_mode="snippet", patched=True)])
+        fr = self._fr([_patch_result(patch_mode="multi_range", patched=True)])
         body = _build_pr_body(FIX_IN, fr, patched=True)
-        assert "Before:" in body
-        assert "After:" in body
         assert "Framework/Process.xaml" in body
 
     def test_body_confirms_rewrite_applied_when_patched(self):
@@ -468,18 +465,18 @@ class TestPrBodyBuilders:
         assert "Proposed rewrite" in body
         assert "NewActivity" in body
 
-    def test_body_shows_skip_reason_when_snippet_not_applied(self):
+    def test_body_shows_skip_reason_when_multi_range_not_applied(self):
         from spectre_coding.agent import _build_pr_body
-        fr = self._fr([_patch_result(patch_mode="snippet", patched=False,
-                                     skip_reason="original_snippet not found verbatim")])
+        fr = self._fr([_patch_result(patch_mode="multi_range", patched=False,
+                                     skip_reason="hunk 0 replacement_lines is not valid XML")])
         body = _build_pr_body(FIX_IN, fr, patched=False)
-        assert "not found verbatim" in body
+        assert "not valid XML" in body
 
     def test_body_shows_multi_file_changes(self):
         from spectre_coding.agent import _build_pr_body
         fr = self._fr([
-            _patch_result(patch_mode="snippet", patched=True, target_file="Framework/Process.xaml"),
-            _patch_result(patch_mode="snippet", patched=True, target_file="Framework/LoginToSAP.xaml"),
+            _patch_result(patch_mode="multi_range", patched=True, target_file="Framework/Process.xaml"),
+            _patch_result(patch_mode="multi_range", patched=True, target_file="Framework/LoginToSAP.xaml"),
         ])
         body = _build_pr_body(FIX_IN, fr, patched=True)
         assert "Framework/Process.xaml" in body
