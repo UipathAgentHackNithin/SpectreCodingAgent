@@ -80,7 +80,7 @@ def _search_kb_for_similar(sdk: UiPath, query: str) -> str:
     return ""
 
 
-def _ingest_fix_to_kb(sdk: UiPath, input: "FixIn", fix_result: dict, pr_url: str, patched: bool) -> None:
+def _ingest_fix_to_kb(sdk: UiPath, input: "FixIn", fix_result: dict, pr_url: str, patched: bool, llm_token: str, base_url: str) -> None:
     """Upload coding agent fix outcome to SpectreKB bucket and trigger re-ingestion."""
     try:
         safe_process = input.process_name.replace(" ", "_")
@@ -105,7 +105,8 @@ def _ingest_fix_to_kb(sdk: UiPath, input: "FixIn", fix_result: dict, pr_url: str
             folder_path=_CG_FOLDER_PATH,
         )
         log.info(f"KB ingest: uploaded {file_name} to '{_CG_BUCKET_NAME}'")
-        sdk.context_grounding.ingest_by_name(name=_CG_INDEX_NAME, folder_path=_CG_FOLDER_PATH)
+        user_sdk = UiPath(base_url=base_url, secret=llm_token)
+        user_sdk.context_grounding.ingest_by_name(name=_CG_INDEX_NAME, folder_path=_CG_FOLDER_PATH)
         log.info("KB ingest: SpectreKB re-ingestion triggered")
     except Exception as e:
         log.warning(f"KB fix ingest failed (non-fatal): {e}")
@@ -472,7 +473,7 @@ async def fix(input: FixIn) -> FixOut:
     log.info(f"Draft PR opened: {pr_url}")
 
     # ── #8: Write fix outcome to SpectreKB so future runs learn from this ────
-    _ingest_fix_to_kb(sdk, input, fix_result, pr_url, any_patched)
+    _ingest_fix_to_kb(sdk, input, fix_result, pr_url, any_patched, llm_token, base_url)
 
     return FixOut(
         fixed=any_patched,
